@@ -39,10 +39,21 @@ class CRUDFrame(ttk.Frame):
         self.search_field = search_field
         self.defaults = defaults or {}
         self.selected_id = None
+        self.selected_row = None
 
         self._build_ui(title)
         self.refresh()
         self._apply_defaults()
+
+    def _notify_change(self, action, data):
+        """Inform the owner of this CRUD frame that data changed.
+        on_change(action, data_dict) - data contains the record values and,
+        for updates/deletes, '_old_student_id' from the selected row."""
+        if self.on_change:
+            try:
+                self.on_change(action, data or {})
+            except TypeError:
+                self.on_change()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self, title):
@@ -137,6 +148,7 @@ class CRUDFrame(ttk.Frame):
             else:
                 var.set("")
         self.selected_id = None
+        self.selected_row = None
         self.tree.selection_remove(self.tree.selection())
         self._apply_defaults()
 
@@ -161,6 +173,7 @@ class CRUDFrame(ttk.Frame):
         columns = ["id"] + [f["name"] for f in self.fields]
         row = dict(zip(columns, vals))
         self.selected_id = row["id"]
+        self.selected_row = row
         self._set_form_values(row)
 
     # -------------------------------------------------------------- CRUD
@@ -211,8 +224,7 @@ class CRUDFrame(ttk.Frame):
         conn.close()
         self.clear_form()
         self.refresh()
-        if self.on_change:
-            self.on_change()
+        self._notify_change("add", all_values)
 
     def update_record(self):
         if not self.selected_id:
@@ -220,6 +232,7 @@ class CRUDFrame(ttk.Frame):
             return
         values = self._get_form_values()
         set_clause = ", ".join([f"{k} = ?" for k in values.keys()])
+        old_student_id = (self.selected_row or {}).get("student_id", "")
         conn = get_connection()
         try:
             conn.execute(f"UPDATE {self.table} SET {set_clause} WHERE {self.id_field} = ?",
@@ -232,8 +245,7 @@ class CRUDFrame(ttk.Frame):
         conn.close()
         self.clear_form()
         self.refresh()
-        if self.on_change:
-            self.on_change()
+        self._notify_change("update", {**values, "_old_student_id": old_student_id})
 
     def delete_record(self):
         if not self.selected_id:
@@ -241,14 +253,14 @@ class CRUDFrame(ttk.Frame):
             return
         if not messagebox.askyesno("Confirm delete", "Delete the selected record? This cannot be undone."):
             return
+        deleted = dict(self.selected_row or {})
         conn = get_connection()
         conn.execute(f"DELETE FROM {self.table} WHERE {self.id_field} = ?", (self.selected_id,))
         conn.commit()
         conn.close()
         self.clear_form()
         self.refresh()
-        if self.on_change:
-            self.on_change()
+        self._notify_change("delete", deleted)
 
     def export_csv(self):
         columns = ["id"] + [f["name"] for f in self.fields]
@@ -270,13 +282,15 @@ class UserCRUDFrame(CRUDFrame):
             values["password"] = hash_password(values["password"])
         # Temporarily inject hashed password back through the normal flow
         self._pending_values = values
-        self._add_record_with(values)
+        if self._add_record_with(values):
+            self._notify_change("add", {k: v for k, v in values.items()
+                                        if k != "password"})
 
     def _add_record_with(self, values):
         missing = [f["label"] for f in self.fields if f.get("required") and not values.get(f["name"])]
         if missing:
             messagebox.showwarning("Missing information", "Please fill in: " + ", ".join(missing))
-            return
+            return False
         all_values = {**values, **self.fixed_values}
         cols = ", ".join(all_values.keys())
         placeholders = ", ".join(["?"] * len(all_values))
@@ -287,12 +301,13 @@ class UserCRUDFrame(CRUDFrame):
         except Exception as e:
             messagebox.showerror("Error", f"Could not add account:\n{e}")
             conn.close()
-            return
+            return False
         conn.close()
         self.clear_form()
         self.refresh()
         if self.on_change:
-            self.on_change()
+            pass   # notified by add_record with the plain values
+        return True
 
     def update_record(self):
         if not self.selected_id:
@@ -305,6 +320,7 @@ class UserCRUDFrame(CRUDFrame):
             values.pop("password", None)  # keep existing password
         if not values:
             return
+        old_student_id = (self.selected_row or {}).get("student_id", "")
         set_clause = ", ".join([f"{k} = ?" for k in values.keys()])
         conn = get_connection()
         try:
@@ -318,8 +334,7 @@ class UserCRUDFrame(CRUDFrame):
         conn.close()
         self.clear_form()
         self.refresh()
-        if self.on_change:
-            self.on_change()
+        self._notify_change("update", {**values, "_old_student_id": old_student_id})
 
     def _set_form_values(self, row):
         for name, (widget, var, ftype) in self.entries.items():

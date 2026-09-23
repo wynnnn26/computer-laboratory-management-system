@@ -266,24 +266,44 @@ def build_auth_response(success: bool, user_data: Dict = None, token: str = None
     return Message.create(MessageType.AUTH_RESPONSE, payload)
 
 
-def build_client_register(pc_name: str, ip: str, mac: str, specs: Dict) -> Message:
+def build_client_register(pc_name: str, ip: str, hostname: str) -> Message:
+    """Register a client PC. Only the fields the dashboard actually shows
+    are transmitted (no bulky hardware specifications)."""
     return Message.create(MessageType.CLIENT_REGISTER, {
         "pc_name": pc_name,
         "ip": ip,
-        "mac": mac,
-        "specs": specs
+        "hostname": hostname,
     })
 
 
-def build_client_heartbeat(pc_name: str, status: str, cpu: float, ram: float, 
-                           logged_in_user: str = None, session_id: str = None) -> Message:
+def build_client_heartbeat(pc_name: str, status: str, cpu: float, ram: float,
+                           logged_in_user: str = None, session_id: str = None,
+                           ip: str = None, hostname: str = None) -> Message:
     return Message.create(MessageType.CLIENT_HEARTBEAT, {
         "pc_name": pc_name,
-        "status": status,  # "locked", "logged_in", "idle", "maintenance"
+        "status": status,  # "locked", "logged_in", "paused", "idle"
         "cpu_percent": cpu,
         "ram_percent": ram,
         "logged_in_user": logged_in_user,
-        "session_id": session_id
+        "session_id": session_id,
+        "ip": ip,
+        "hostname": hostname,
+    })
+
+
+def build_heartbeat_ack(admin_state: str = "") -> Message:
+    """Server -> Client reply to every heartbeat.
+
+    Serves two purposes:
+      * liveness - the client knows the link is alive (it force-reconnects
+        if no traffic arrives for several heartbeat intervals), which is what
+        unsticks a client after the server restarts.
+      * state sync - carries the server's authoritative admin state
+        ("lock"/"pause" desired state JSON) so both sides stay synchronized.
+    """
+    return Message.create(MessageType.PONG, {
+        "admin_state": admin_state or "",
+        "ts": time.time(),
     })
 
 
@@ -334,14 +354,14 @@ def build_activity_log(admin_user: str, action: str, target: str, details: str =
     })
 
 
-def build_screenshot_request(quality: int = 50, scale: float = 0.5) -> Message:
+def build_screenshot_request(quality: int = 70, scale: float = 0.75) -> Message:
     return Message.create(MessageType.CMD_SCREENSHOT, {
         "quality": quality,
         "scale": scale
     })
 
 
-def build_screen_observe_start(interval: float = 1.0, quality: int = 30, scale: float = 0.4) -> Message:
+def build_screen_observe_start(interval: float = 1.0, quality: int = 50, scale: float = 0.6) -> Message:
     return Message.create(MessageType.CMD_SCREEN_OBSERVE_START, {
         "interval": interval,
         "quality": quality,

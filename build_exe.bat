@@ -1,11 +1,11 @@
 @echo off
 REM ============================================================
 REM  Build script for Computer Laboratory Management System
-REM  (LAN Client-Server Edition)
+REM  (LAN Client-Server / Internet Cafe Edition)
 REM  Run this on a Windows PC that has Python 3.9+ installed.
 REM  Produces:
-REM    dist\LabServer.exe   (server + admin console + launcher)
-REM    dist\LabClient.exe   (fullscreen client kiosk for lab PCs)
+REM    dist\server.exe   - direct Server + Admin Console mode
+REM    dist\client.exe   - direct Client kiosk mode
 REM ============================================================
 
 echo Checking Python installation...
@@ -22,18 +22,23 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
 echo.
-echo Building LabServer.exe (Server + Admin Console)...
-python -m PyInstaller --noconfirm --onefile --windowed --name "LabServer" main.py
+echo Building server.exe (Server + Admin Console - opens directly in Server mode)...
+python -m PyInstaller --noconfirm --onefile --windowed --name "server" main.py
 
-echo Building LabClient.exe (Client kiosk for lab PCs)...
-python -m PyInstaller --noconfirm --onefile --windowed --name "LabClient" client.py
+echo Building client.exe (Client kiosk - opens directly in Client mode)...
+python -m PyInstaller --noconfirm --onefile --windowed --name "client" main.py
 
 echo.
 echo ============================================================
 echo  Build complete:
-echo    dist\LabServer.exe  - run on the Admin/Server PC
-echo    dist\LabClient.exe  - run on every client/lab PC
-echo  A lab_system.db file is created next to LabServer.exe on
-echo  first run. Client PCs ask for the Server IP on first run.
+echo    dist\server.exe  - run on the Admin/Server PC
+echo                        (starts directly in Server/Admin mode,
+echo                         no Server/Client choice prompt)
+echo    dist\client.exe  - run on every client/lab PC
+REM (the mode is detected from the executable name "server"/"client")
+echo.
+echo  A lab_system.db file is created next to server.exe on first run.
+echo  Client PCs ask for the Server IP once; it is saved next to
+echo  client.exe and reused automatically (auto-reconnect included).
 echo ============================================================
 pause

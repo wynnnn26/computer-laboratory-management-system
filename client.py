@@ -59,7 +59,14 @@ WARN = "#e5a83d"
 # Configuration helpers
 # ==========================================================================
 def config_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_NAME)
+    """Config lives next to the running app (works as .py AND frozen .exe,
+    where __file__ points into the temp extraction folder)."""
+    import sys
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, CONFIG_NAME)
 
 
 def load_config():
@@ -100,21 +107,11 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
-def collect_specs() -> dict:
-    vm = psutil.virtual_memory()
+def get_hostname() -> str:
     try:
-        disk = psutil.disk_usage(os.environ.get("SystemDrive", "C:"))
-        disk_str = f"{disk.total // (1024 ** 3)}GB"
+        return socket.gethostname()
     except Exception:
-        disk_str = "?"
-    return {
-        "os": f"{platform.system()} {platform.release()}",
-        "cpu": platform.processor() or platform.machine(),
-        "cpu_cores": psutil.cpu_count(logical=True),
-        "ram_total": f"{vm.total // (1024 ** 3)}GB",
-        "disk_total": disk_str,
-        "python": platform.python_version(),
-    }
+        return ""
 
 
 def snapshot_metrics() -> tuple:
@@ -259,7 +256,17 @@ def ctypes_GetAsyncKeyState(vk):
 # Client network (TLS)
 # ==========================================================================
 class ClientNetwork:
-    """Maintains the TLS connection to the server and routes messages."""
+    """Maintains the TLS connection to the server and routes messages.
+
+    Reliability rules (Phase A / #12):
+      * every heartbeat is acknowledged by the server (PONG), so a dead or
+        restarted server is detected within a few seconds;
+      * a failed send or a stale link (no traffic for 20 s) forces an
+        immediate close, and the connect loop retries every 2.5 s;
+      * every (re)connection re-registers the PC with the server.
+    """
+
+    STALE_LINK_SECONDS = 20
 
     def __init__(self, events: "queue.Queue"):
         self.events = events
@@ -268,6 +275,8 @@ class ClientNetwork:
         self.server_ip = ""
         self.server_port = 8443
         self.pc_name = socket.gethostname()
+        self.last_recv = time.time()
+        self.last_admin_state = ""
         self._stop = threading.Event()
         self._recv_thread = None
         self._conn_thread = None
@@ -279,9 +288,10 @@ class ClientNetwork:
         self.server_ip = server_ip
         self.server_port = server_port
         self._stop.clear()
-        self._conn_thread = threading.Thread(target=self._connect_loop,
-                                             daemon=True, name="net-connect")
-        self._conn_thread.start()
+        if self._conn_thread is None or not self._conn_thread.is_alive():
+            self._conn_thread = threading.Thread(target=self._connect_loop,
+                                                 daemon=True, name="net-connect")
+            self._conn_thread.start()
 
     def stop(self):
         self._stop.set()
@@ -295,6 +305,15 @@ class ClientNetwork:
             self.wrapper = None
         client_api.set_link(None)
 
+    def _drop_connection(self, reason):
+        """Force-close a dead link and tell the UI to show the lock/reconnect
+        screen exactly once."""
+        if not self.connected:
+            return
+        self._close_socket()
+        self.events.put({"kind": "net_disconnected"})
+        self.events.put({"kind": "net_status", "text": reason})
+
     def _connect_loop(self):
         while not self._stop.is_set():
             if not self.connected:
@@ -305,9 +324,11 @@ class ClientNetwork:
                     ctx = create_ssl_context(is_server=False)
                     tls = ctx.wrap_socket(raw, server_hostname=self.server_ip)
                     self.wrapper = TLSSocketWrapper(tls)
-                    # Register immediately
+                    self.last_recv = time.time()
+                    # Register immediately (re-registers after every
+                    # server restart / reconnect).
                     reg = build_client_register(self.pc_name, get_local_ip(),
-                                                get_mac_address(), collect_specs())
+                                                get_hostname())
                     self.wrapper.send_message(reg)
                     self.connected = True
                     client_api.set_link(self)
@@ -320,26 +341,34 @@ class ClientNetwork:
                 except Exception as e:
                     self.events.put({"kind": "net_status",
                                      "text": f"Server unreachable ({e}). Retrying…"})
+            else:
+                # Liveness: the server ACKs every heartbeat (<=5 s apart).
+                # No traffic for 20 s means the link/server is gone.
+                if time.time() - self.last_recv > self.STALE_LINK_SECONDS:
+                    self._drop_connection(
+                        "Server stopped responding. Reconnecting…")
             time.sleep(2.5)
 
     def _recv_loop(self):
         while not self._stop.is_set() and self.connected:
-            msg = self.wrapper.recv_message(timeout=0.5)
+            wrapper = self.wrapper
+            if wrapper is None:                 # closed concurrently
+                break
+            msg = wrapper.recv_message(timeout=0.5)
             if msg is None:
                 # distinguish timeout vs disconnect
                 try:
-                    self.wrapper.sock.getpeername()
+                    wrapper.sock.getpeername()
                     continue
                 except Exception:
                     pass
-            if msg is None:
-                was = self.connected
-                self._close_socket()
-                if was:
-                    self.events.put({"kind": "net_disconnected"})
-                    self.events.put({"kind": "net_status",
-                                     "text": "Connection lost. Reconnecting…"})
+                self._drop_connection("Connection lost. Reconnecting…")
                 break
+            self.last_recv = time.time()
+            # Heartbeat acknowledgement / admin state sync
+            if msg.type == MessageType.PONG.value:
+                self.last_admin_state = msg.payload.get("admin_state", "")
+                continue
             # Route responses for blocking .request() calls
             if msg.type == MessageType.STU_RESPONSE.value:
                 ref = msg.payload.get("ref") or msg.msg_id
@@ -353,7 +382,12 @@ class ClientNetwork:
     def send(self, msg: Message) -> bool:
         if not self.connected or not self.wrapper:
             return False
-        return self.wrapper.send_message(msg)
+        ok = self.wrapper.send_message(msg)
+        if not ok:
+            # A failed write means the server is gone - reconnect at once
+            # instead of pretending to stay connected.
+            self._drop_connection("Connection lost. Reconnecting…")
+        return ok
 
     def request(self, kind: str, payload: dict, timeout: float = 8.0) -> dict:
         """Blocking purpose-built query; waits for the server's response."""
@@ -395,8 +429,12 @@ class ClientApp(tk.Tk):
         self.session_start = None
         self.observe_stop = None
         self.lock_reason = ""
-        self.pause_until = 0
+        self.pause_win = None
+        self.pause_count_lbl = None
+        self._pause_msg_lbl = None
         self.pause_message = ""
+        self._power_token = None         # armed only by an admin power command
+        self._after_verify = None
 
         # --- root/kiosk window ------------------------------------------
         self.overrideredirect(True)
@@ -414,13 +452,15 @@ class ClientApp(tk.Tk):
         self._build_kiosk()
         self._build_bar()
 
-        # start networking
+        # start networking (server IP is saved once and reused automatically)
         cfg = load_config()
-        if not cfg.get("server_ip"):
-            self.withdraw()
-            self.after(150, self._ask_server_config)
-        else:
+        if cfg.get("server_ip"):
             self.net.start(cfg["server_ip"], int(cfg.get("server_port", 8443)))
+        else:
+            # First run: stay visible and locked, ask for the server IP only
+            # when the operator clicks the settings button (no modal loop,
+            # no hidden window - closing/cancelling never traps the kiosk).
+            self.after(200, self._announce_unconfigured)
 
         self.hotkeys.start()
         self._pump()
@@ -446,7 +486,15 @@ class ClientApp(tk.Tk):
 
         self.status_lbl = tk.Label(wrap, text="Starting…", font=("Segoe UI", 10),
                                    fg=WARN, bg=BG_DARK)
-        self.status_lbl.pack(pady=(0, 18))
+        self.status_lbl.pack(pady=(0, 8))
+
+        # Shown only on first run (no saved server IP yet).
+        self.config_btn = tk.Button(wrap, text="⚙  Server Settings",
+                                    command=self._ask_server_config,
+                                    bg="#44507a", fg="white", relief="flat",
+                                    font=("Segoe UI", 10, "bold"),
+                                    cursor="hand2", padx=14, pady=4)
+        # not packed until _announce_unconfigured()
 
         card = tk.Frame(wrap, bg="white", padx=2, pady=2)
         card.pack(fill="x")
@@ -487,6 +535,13 @@ class ClientApp(tk.Tk):
                  font=("Segoe UI", 9), fg="#8e9bc4", bg=BG_DARK,
                  justify="center").pack(side="bottom", pady=18)
 
+        # First run (no saved server IP): always offer the settings button,
+        # including after every relock, so the kiosk is never stuck.
+        if not load_config().get("server_ip"):
+            self.config_btn.pack(pady=(0, 14))
+            self.status_lbl.config(
+                text="Server IP not configured — open Server Settings below.")
+
     def _build_bar(self):
         """Floating session bar shown while the PC is unlocked."""
         self.bar = tk.Toplevel(self)
@@ -523,22 +578,38 @@ class ClientApp(tk.Tk):
                   font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="right")
 
     # ------------------------------------------------------- config dialog
+    def _announce_unconfigured(self):
+        """First-run state: locked, visible, waiting for the server IP.
+        (_build_kiosk already shows the button; this is just the nudge.)"""
+        if hasattr(self, "status_lbl") and self.status_lbl.winfo_exists():
+            self.status_lbl.config(
+                text="Server IP not configured — open Server Settings below.")
+
     def _ask_server_config(self):
+        """One-time server IP configuration. The value is saved to disk and
+        reused automatically on every start; cancelling just returns to the
+        locked screen (it never loops or hides the kiosk)."""
         cfg = load_config()
         ip = simpledialog.askstring(
             "Server Connection",
             "Enter the Server (Admin PC) IP address on the LAN:",
             initialvalue=cfg.get("server_ip", "192.168.1.100"), parent=self)
         if not ip:
-            self.after(300, self._ask_server_config)
+            self._announce_unconfigured()
             return
         port = simpledialog.askstring(
             "Server Connection", "Server port:",
             initialvalue=str(cfg.get("server_port", "8443")), parent=self) or "8443"
-        cfg.update({"server_ip": ip.strip(), "server_port": int(port)})
+        try:
+            port_val = int(port)
+        except ValueError:
+            port_val = 8443
+        cfg.update({"server_ip": ip.strip(), "server_port": port_val})
         save_config(cfg)
-        self.deiconify()
-        self.net.start(cfg["server_ip"], cfg["server_port"])
+        cfg_btn = getattr(self, "config_btn", None)
+        if cfg_btn is not None:
+            cfg_btn.pack_forget()
+        self.net.start(cfg["server_ip"], port_val)
 
     # ------------------------------------------------------------ login
     def attempt_login(self):
@@ -547,21 +618,53 @@ class ClientApp(tk.Tk):
         if not uid or not pw:
             self._login_error("Please enter both User ID and password.")
             return
+        if self.state == self.STATE_ADMIN_LOCK:
+            # Admin Lock cannot be bypassed by typing credentials: only an
+            # explicit Admin Unlock (force login) releases this PC.
+            self._login_error("This PC is locked by the administrator. "
+                              "Waiting for Admin Unlock…")
+            return
         if not self.net.connected:
             self._login_error("Not connected to the server yet. Please wait…")
             return
         self.login_btn.config(state="disabled", text="Verifying…")
         self.msg_lbl.config(text="", fg="#ff8585")
-        info = collect_specs()
-        info.update({"ip": get_local_ip(), "mac": get_mac_address()})
+        info = {"hostname": get_hostname(), "ip": get_local_ip()}
         self.net.send(build_auth_request(uid, pw, "student", info))
+        # Never leave the button stuck on "Verifying…" if the server
+        # does not answer (Phase A/#5 fix).
+        try:
+            if getattr(self, "_after_verify", None):
+                self.after_cancel(self._after_verify)
+            self._after_verify = self.after(15000, self._verify_timeout)
+        except Exception:
+            self._after_verify = None
+
+    def _verify_timeout(self):
+        self._after_verify = None
+        btn_text = str(self.login_btn.cget("text"))
+        if btn_text == "Verifying…":
+            self.login_btn.config(state="normal", text="Log In")
+            self.msg_lbl.config(
+                text="Server did not respond. Please try again.", fg="#ff8585")
+
+    def _cancel_verify_timeout(self):
+        aid = getattr(self, "_after_verify", None)
+        if aid:
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+            self._after_verify = None
 
     def _login_error(self, text):
+        self._cancel_verify_timeout()
         self.msg_lbl.config(text=text, fg="#ff8585")
         self.login_btn.config(state="normal", text="Log In")
 
     # ------------------------------------------------------- session mgmt
     def _on_auth_ok(self, user_data):
+        self._cancel_verify_timeout()
         # If a session is still open (e.g. after an admin lock), reuse it when
         # the same user returns; otherwise close the stale one first.
         if self.session_id:
@@ -605,6 +708,8 @@ class ClientApp(tk.Tk):
 
     def user_logout(self, reason=""):
         """End the session locally and return to the login screen."""
+        self._cancel_verify_timeout()
+        self._close_pause_win()          # never leave a pause overlay behind
         if self.session_id:
             dur = int(time.time() - (self.session_start or time.time()))
             self.net.send(build_session_end(self.session_id, time.time(), dur))
@@ -636,12 +741,18 @@ class ClientApp(tk.Tk):
             pass
 
     # ------------------------------------------------------ pause / lock
-    def _show_pause(self, message, seconds):
+    def _show_pause(self, message, seconds=0):
+        """Pause stays active until the admin explicitly sends Resume -
+        there is NO automatic expiry (Phase B/#6)."""
+        self.pause_message = message or "Paused by administrator"
         if self.state == self.STATE_PAUSED:
+            # Update the message on a repeated pause instead of leaking
+            # a second overlay window.
+            if hasattr(self, "_pause_msg_lbl"):
+                self._pause_msg_lbl.config(text=self.pause_message)
             return
         self.state = self.STATE_PAUSED
-        self.pause_until = time.time() + (seconds or 0)
-        self.pause_message = message or "Paused by administrator"
+        self.pause_until = 0
         self.bar.withdraw()
         self.withdraw()
 
@@ -655,16 +766,23 @@ class ClientApp(tk.Tk):
                  fg=WARN, bg="#2b1a06").pack(pady=(sh // 5, 10))
         tk.Label(self.pause_win, text="SESSION PAUSED", font=("Segoe UI", 34, "bold"),
                  fg="white", bg="#2b1a06").pack()
-        tk.Label(self.pause_win, text=self.pause_message, font=("Segoe UI", 16),
-                 fg=WARN, bg="#2b1a06", wraplength=700, justify="center").pack(pady=14)
-        self.pause_count_lbl = tk.Label(self.pause_win, text="", font=("Consolas", 22, "bold"),
+        self._pause_msg_lbl = tk.Label(
+            self.pause_win, text=self.pause_message, font=("Segoe UI", 16),
+            fg=WARN, bg="#2b1a06", wraplength=700, justify="center")
+        self._pause_msg_lbl.pack(pady=14)
+        self.pause_count_lbl = tk.Label(self.pause_win, text="",
+                                        font=("Consolas", 18, "bold"),
                                         fg="#ffd79a", bg="#2b1a06")
         self.pause_count_lbl.pack(pady=8)
+        tk.Label(self.pause_win,
+                 text="The administrator must press Resume to continue.",
+                 font=("Segoe UI", 11), fg="#c9a86a", bg="#2b1a06").pack(pady=6)
         self.pause_win.protocol("WM_DELETE_WINDOW", self._ignore_close)
         self.pause_win.grab_set()
         self.hotkeys.start()
 
-    def _hide_pause(self):
+    def _close_pause_win(self):
+        """Destroy the pause overlay if it exists (no UI state change)."""
         win = getattr(self, "pause_win", None)
         if win:
             try:
@@ -673,6 +791,11 @@ class ClientApp(tk.Tk):
             except Exception:
                 pass
             self.pause_win = None
+        self.pause_count_lbl = None
+        self._pause_msg_lbl = None
+
+    def _hide_pause(self):
+        self._close_pause_win()
         if self.user:
             self._unlock_ui()
         else:
@@ -684,38 +807,49 @@ class ClientApp(tk.Tk):
 
     # -------------------------------------------------- remote commands
     def handle_command(self, msg: Message):
+        """Execute a server command and ALWAYS acknowledge it (Phase F/#7).
+
+        Power actions (restart/shutdown) are the only commands that arm a
+        one-shot token consumed by _os_power - nothing else in the app can
+        trigger them (Phase B/#13).
+        """
         t, p = msg.type, msg.payload
         cid = p.get("command_id")
 
         if t == MessageType.CMD_LOCK.value:
-            if self.state in (self.STATE_UNLOCKED, self.STATE_ADMIN_LOCK,
-                              self.STATE_PAUSED, self.STATE_LOGIN):
-                # keep the session; show lock screen requiring re-auth
-                self._hide_pause()
-                self.bar.withdraw()
-                self._close_dashboard()
-                self._show_lock(p.get("params", {}).get("message",
-                                                        "Locked by the administrator."),
-                                error=True)
-                self.state = self.STATE_ADMIN_LOCK
+            # keep the session; show the lock screen and block any login
+            # until the admin explicitly unlocks (force login).
+            self._cancel_verify_timeout()
+            self._close_pause_win()
+            self.bar.withdraw()
+            self._close_dashboard()
+            self._show_lock(p.get("params", {}).get("message",
+                                                    "Locked by the administrator."),
+                            error=True)
+            self.state = self.STATE_ADMIN_LOCK
             self._send_cmd_response(cid, True)
 
         elif t == MessageType.CMD_UNLOCK.value:
-            if self.user:                    # an authenticated session exists
-                self._hide_pause()
+            # Admin Force Login: restore the still-open session directly -
+            # no customer credentials are requested. Without a session the
+            # PC simply returns to a normal (login allowed) lock screen.
+            had_user = bool(self.user)
+            self._cancel_verify_timeout()
+            self._close_pause_win()
+            if had_user:
                 self._unlock_ui()
-                self._send_cmd_response(cid, True)
+                self._send_cmd_response(cid, True, result="force_login")
             else:
-                self._show_lock("Unlocked by administrator — please log in.", error=False)
-                self._send_cmd_response(cid, True, result="login_required")
+                self._show_lock("Unlocked by administrator — please log in.",
+                                error=False)
+                self._send_cmd_response(cid, True, result="login_allowed")
 
         elif t == MessageType.CMD_LOGOUT.value:
             self.user_logout("Remote logout by administrator")
             self._send_cmd_response(cid, True)
 
         elif t == MessageType.CMD_PAUSE.value:
-            self._show_pause(p.get("params", {}).get("message"),
-                             p.get("params", {}).get("seconds", 0))
+            self._show_pause(p.get("params", {}).get("message"))
             self._send_cmd_response(cid, True)
 
         elif t == MessageType.CMD_RESUME.value:
@@ -723,10 +857,12 @@ class ClientApp(tk.Tk):
             self._send_cmd_response(cid, True)
 
         elif t == MessageType.CMD_RESTART.value:
+            self._power_token = "restart"        # one-shot, admin-authenticated
             self._send_cmd_response(cid, True, result="restarting")
             self.after(1500, lambda: self._os_power("restart"))
 
         elif t == MessageType.CMD_SHUTDOWN.value:
+            self._power_token = "shutdown"       # one-shot, admin-authenticated
             self._send_cmd_response(cid, True, result="shutting_down")
             self.after(1500, lambda: self._os_power("shutdown"))
 
@@ -739,7 +875,7 @@ class ClientApp(tk.Tk):
 
         elif t == MessageType.CMD_SCREENSHOT.value:
             try:
-                img = capture_screen_b64(p.get("quality", 50), p.get("scale", 0.5))
+                img = capture_screen_b64(p.get("quality", 50), p.get("scale", 0.75))
                 resp = Message(type=MessageType.CMD_SCREENSHOT.value,
                                payload={"image": img, "pc_name": self.net.pc_name,
                                         "command_id": cid, "ref": msg.msg_id})
@@ -752,8 +888,8 @@ class ClientApp(tk.Tk):
             params = p.get("params", p)
             self.start_observation(msg.msg_id,
                                    float(params.get("interval", 1.0)),
-                                   int(params.get("quality", 30)),
-                                   float(params.get("scale", 0.4)))
+                                   int(params.get("quality", 50)),
+                                   float(params.get("scale", 0.6)))
             self._send_cmd_response(cid, True, result="observing")
 
         elif t == MessageType.CMD_SCREEN_OBSERVE_STOP.value:
@@ -761,6 +897,19 @@ class ClientApp(tk.Tk):
             self._send_cmd_response(cid, True, result="stopped")
 
     def _os_power(self, action):
+        """Executes restart/shutdown.
+
+        SAFETY (Phase B/#13): this is the ONLY place in the entire client
+        that touches OS power, and it only runs when _power_token was armed
+        by an explicit authenticated admin CMD_RESTART/CMD_SHUTDOWN message
+        from the server. Heartbeat loss, timeouts, reconnect failures,
+        exceptions, logout and window closing can NEVER reach it.
+        """
+        if self._power_token != action:
+            print(f"[CLIENT] Blocked unsolicited power action: {action}")
+            return
+        self._power_token = None                # one-shot: consume the token
+        print(f"[CLIENT] Executing admin-commanded {action}")
         try:
             if os.name == "nt":
                 if action == "restart":
@@ -834,14 +983,33 @@ class ClientApp(tk.Tk):
             self._dash = None
 
     # ------------------------------------------------------------ event pump
+    def _collapse_timer(self, attr):
+        """Cancel a pending Tk timer stored in `attr`.
+
+        Called at the start of _pump/_tick so that however often the method
+        runs (manual calls included) only ONE timer chain can exist - orphaned
+        after-callbacks can therefore never fire on a destroyed window.
+        """
+        aid = getattr(self, attr, None)
+        if aid:
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+            setattr(self, attr, None)
+
     def _pump(self):
+        self._collapse_timer("_after_pump")
         try:
             while True:
                 ev = self.events.get_nowait()
                 self._handle_event(ev)
         except queue.Empty:
             pass
-        self.after(80, self._pump)
+        try:
+            self._after_pump = self.after(80, self._pump)
+        except Exception:
+            self._after_pump = None
 
     def _handle_event(self, ev):
         kind = ev.get("kind")
@@ -849,16 +1017,23 @@ class ClientApp(tk.Tk):
             if hasattr(self, "status_lbl") and self.status_lbl.winfo_exists():
                 self.status_lbl.config(text=ev["text"])
         elif kind == "net_disconnected":
+            # Preserve an admin lock across server outages so a server
+            # restart can never be used to bypass it (Phase C/#1-2).
+            was_admin_locked = self.state == self.STATE_ADMIN_LOCK
             if self.state in (self.STATE_UNLOCKED, self.STATE_PAUSED):
                 self.user_logout("Connection to server lost")
             self._close_dashboard()
             self.stop_observation()
-            self._show_lock("Connection to server lost. Reconnecting…", error=True)
+            self._show_lock("Connection to server lost. Reconnecting…",
+                            error=True)
+            if was_admin_locked:
+                self.state = self.STATE_ADMIN_LOCK
         elif kind == "message":
             msg = ev["msg"]
             if msg.type == MessageType.AUTH_RESPONSE.value:
                 self._handle_auth_response(msg.payload)
-            elif msg.type == MessageType.STU_RESPONSE.value:
+            elif msg.type in (MessageType.STU_RESPONSE.value,
+                              MessageType.PONG.value):
                 pass
             else:
                 try:
@@ -867,6 +1042,7 @@ class ClientApp(tk.Tk):
                     traceback.print_exc()
 
     def _handle_auth_response(self, p):
+        self._cancel_verify_timeout()
         self.login_btn.config(state="normal", text="Log In")
         if p.get("success"):
             self._on_auth_ok(p.get("user_data") or {})
@@ -878,8 +1054,23 @@ class ClientApp(tk.Tk):
                 details=p.get("error", "")))
 
     # ------------------------------------------------------------ heartbeat
+    def _send_heartbeat(self, cpu=None, ram=None):
+        if cpu is None or ram is None:
+            try:
+                cpu, ram = snapshot_metrics()
+            except Exception:
+                cpu, ram = 0.0, 0.0
+        status = {"login": "locked", "admin_lock": "locked",
+                  "unlocked": "logged_in", "paused": "paused"}[self.state]
+        self.net.send(build_client_heartbeat(
+            pc_name=self.net.pc_name, status=status, cpu=cpu, ram=ram,
+            logged_in_user=self.user.get("student_id") if self.user else None,
+            session_id=self.session_id,
+            ip=get_local_ip(), hostname=get_hostname()))
+
     def _tick(self):
-        """1-second UI ticker: clock, pause countdown, heartbeat."""
+        """1-second UI ticker: clock, pause text, heartbeat."""
+        self._collapse_timer("_after_tick")   # single chain, never orphaned
         try:
             cpu, ram = snapshot_metrics()
         except Exception:
@@ -892,29 +1083,52 @@ class ClientApp(tk.Tk):
             self.bar_metrics.config(text=f"CPU {cpu:.0f}%  RAM {ram:.0f}%")
 
         if self.state == self.STATE_PAUSED:
-            if self.pause_until and time.time() >= self.pause_until:
-                self._hide_pause()
-            else:
-                left = max(0, int(self.pause_until - time.time())) if self.pause_until else 0
-                txt = f"Resumes in {left // 60:02d}:{left % 60:02d}" if self.pause_until \
-                    else "Waiting for the administrator to resume…"
-                if hasattr(self, "pause_count_lbl"):
-                    self.pause_count_lbl.config(text=txt)
+            # Pause NEVER expires on its own - only CMD_RESUME clears it.
+            if self.pause_count_lbl:
+                self.pause_count_lbl.config(
+                    text="Waiting for the administrator to resume…")
 
-        # heartbeat every 5 s
+        # heartbeat every 5 s (server ACKs each one - that is also how we
+        # detect a restarted/dead server and reconnect automatically)
         if int(time.time()) % 5 == 0 and getattr(self, "_last_hb", 0) != int(time.time()):
             self._last_hb = int(time.time())
-            status = {"login": "locked", "admin_lock": "locked",
-                      "unlocked": "logged_in", "paused": "paused"}[self.state]
-            self.net.send(build_client_heartbeat(
-                pc_name=self.net.pc_name, status=status, cpu=cpu, ram=ram,
-                logged_in_user=self.user.get("student_id") if self.user else None,
-                session_id=self.session_id))
+            self._send_heartbeat(cpu, ram)
 
-        self.after(1000, self._tick)
+        try:
+            self._after_tick = self.after(1000, self._tick)
+        except Exception:
+            self._after_tick = None
 
     def _pulse_metrics(self):
         pass    # metrics are refreshed in _tick
+
+    def destroy(self):
+        """Cancel pending Tk timers before teardown (avoids after-callback
+        errors when the window is destroyed mid-tick)."""
+        self._cancel_verify_timeout()
+        try:
+            self.stop_observation()
+        except Exception:
+            pass
+        # close the pause overlay first so any stray ticker callback that
+        # still fires after teardown is harmless (labels are set to None).
+        try:
+            self._close_pause_win()
+        except Exception:
+            pass
+        for attr in ("_after_pump", "_after_tick"):
+            after_id = getattr(self, attr, None)
+            if after_id:
+                try:
+                    self.after_cancel(after_id)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        # NOTE: never touches OS power - closing is always power-safe.
+        try:
+            super().destroy()
+        except Exception:
+            pass
 
 
 # ==========================================================================

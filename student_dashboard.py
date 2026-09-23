@@ -1,8 +1,10 @@
 """
 student_dashboard.py
-The window a logged-in student sees: time in/out for lab attendance,
-PC selection, personal attendance history, announcements, and messaging
-with the administrator.
+The window a logged-in student sees: announcements, messaging with the
+administrator, and equipment borrowing.
+
+(Lab Attendance was intentionally removed - the system now focuses on
+Internet Cafe / Computer Lab PC management.)
 
 All data flows through client_api, which talks to the central Server over
 the LAN when running in Client Mode, or falls back to the original direct
@@ -12,7 +14,7 @@ SQLite access when running standalone on the server PC.
 import tkinter as tk
 from tkinter import ttk, messagebox
 import client_api
-from utils import now_date, now_time, export_rows_to_csv, FONT_TITLE, FONT_HEADER, center_window
+from utils import FONT_TITLE, FONT_HEADER, center_window
 
 BG_DARK = "#1f2a44"
 BG_LIGHT = "#f4f6fb"
@@ -45,17 +47,15 @@ class StudentDashboard(tk.Toplevel):
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.attendance_tab = ttk.Frame(notebook)
         self.announce_tab = ttk.Frame(notebook)
         self.messages_tab = ttk.Frame(notebook)
         self.borrow_tab = ttk.Frame(notebook)
 
-        notebook.add(self.attendance_tab, text="  Lab Attendance  ")
+        # (Lab Attendance tab removed - Phase K/#14)
         notebook.add(self.announce_tab, text="  Announcements  ")
         notebook.add(self.messages_tab, text="  Messages  ")
         notebook.add(self.borrow_tab, text="  Borrow Equipment  ")
 
-        self._build_attendance_tab()
         self._build_announcements_tab()
         self._build_messages_tab()
         self._build_borrow_tab()
@@ -100,127 +100,7 @@ class StudentDashboard(tk.Toplevel):
         if self.on_logout:
             self.on_logout()
 
-    # ------------------------------------------------------- attendance
-    def _build_attendance_tab(self):
-        top = tk.Frame(self.attendance_tab, bg=BG_LIGHT)
-        top.pack(fill="x", padx=12, pady=12)
-
-        card = tk.Frame(top, bg="white", highlightbackground="#dde3f0",
-                        highlightthickness=1)
-        card.pack(fill="x")
-
-        row = tk.Frame(card, bg="white")
-        row.pack(fill="x", padx=14, pady=12)
-
-        tk.Label(row, text="Select PC:", font=("Segoe UI", 10, "bold"),
-                 bg="white").pack(side="left")
-        self.pc_var = tk.StringVar()
-        self.pc_combo = ttk.Combobox(row, textvariable=self.pc_var, state="readonly", width=24)
-        self.pc_combo.pack(side="left", padx=8)
-        self._load_available_pcs()
-
-        for text, cmd, color in [
-            ("Time In", self.time_in, ACCENT),
-            ("Time Out", self.time_out, DANGER),
-            ("Refresh", self.refresh_attendance, "#44507a"),
-            ("Export CSV", self.export_my_attendance, SUCCESS),
-        ]:
-            tk.Button(row, text=text, command=cmd, bg=color, fg="white", relief="flat",
-                      font=("Segoe UI", 9, "bold"), cursor="hand2", padx=10,
-                      pady=5).pack(side="left", padx=4)
-
-        self.session_lbl = tk.Label(card, text="", font=("Segoe UI", 9),
-                                    fg=SUCCESS, bg="white", anchor="w")
-        self.session_lbl.pack(fill="x", padx=14, pady=(0, 10))
-
-        ttk.Label(self.attendance_tab, text="My Attendance History",
-                  font=FONT_HEADER).pack(anchor="w", padx=14, pady=(8, 2))
-
-        cols = ("date", "time_in", "time_out", "pc_name", "status")
-        self.att_tree = ttk.Treeview(self.attendance_tab, columns=cols,
-                                     show="headings", height=13)
-        for c, label in zip(cols, ["Date", "Time In", "Time Out", "PC Used", "Status"]):
-            self.att_tree.heading(c, text=label)
-            self.att_tree.column(c, width=150)
-        vsb = ttk.Scrollbar(self.attendance_tab, orient="vertical",
-                            command=self.att_tree.yview)
-        self.att_tree.configure(yscrollcommand=vsb.set)
-        self.att_tree.pack(side="left", fill="both", expand=True, padx=(14, 0), pady=8)
-        vsb.pack(side="left", fill="y", pady=8, padx=(0, 14))
-        self.refresh_attendance()
-
-    def _load_available_pcs(self):
-        resp = client_api.fetch_available_pcs()
-        pcs = resp.get("data", []) if resp.get("ok") else []
-        self.pc_combo["values"] = pcs
-
-    def _active_session(self):
-        """Today's open session as reported by the server (or local DB)."""
-        resp = client_api.fetch_attendance(self.get("student_id"))
-        if not resp.get("ok"):
-            return None
-        today = now_date()
-        for r in resp.get("data", []):
-            if g(r, "date") == today and g(r, "status") == "In Lab":
-                return r
-        return None
-
-    def time_in(self):
-        if self._active_session():
-            messagebox.showinfo("Already timed in",
-                                "You already have an active lab session today.",
-                                parent=self)
-            return
-        pc = self.pc_var.get()
-        if not pc:
-            messagebox.showwarning("Select a PC",
-                                   "Please select an available PC before timing in.",
-                                   parent=self)
-            return
-        resp = client_api.time_in(self.get("student_id"), self.get("full_name"), pc)
-        if not resp.get("ok"):
-            messagebox.showerror("Time In failed", resp.get("error", "Unknown error"),
-                                 parent=self)
-            return
-        messagebox.showinfo("Timed in", f"Time in recorded for {pc} at {now_time()}.",
-                            parent=self)
-        self._load_available_pcs()
-        self.refresh_attendance()
-
-    def time_out(self):
-        resp = client_api.time_out(self.get("student_id"))
-        if not resp.get("ok"):
-            messagebox.showinfo("No active session",
-                                resp.get("error", "You have no active session."),
-                                parent=self)
-            return
-        messagebox.showinfo("Timed out", f"Time out recorded at {now_time()}.",
-                            parent=self)
-        self._load_available_pcs()
-        self.refresh_attendance()
-
-    def refresh_attendance(self):
-        resp = client_api.fetch_attendance(self.get("student_id"))
-        rows = resp.get("data", []) if resp.get("ok") else []
-        for i in self.att_tree.get_children():
-            self.att_tree.delete(i)
-        for r in rows:
-            self.att_tree.insert("", "end", values=(
-                g(r, "date"), g(r, "time_in"), g(r, "time_out") or "-",
-                g(r, "pc_name"), g(r, "status")))
-        active = self._active_session()
-        if active:
-            self.session_lbl.config(
-                text=f"● Active session on {g(active, 'pc_name')} since "
-                     f"{g(active, 'time_in')}", fg=SUCCESS)
-        else:
-            self.session_lbl.config(text="○ No active session today.", fg="#8a93ad")
-
-    def export_my_attendance(self):
-        rows = [self.att_tree.item(i)["values"] for i in self.att_tree.get_children()]
-        export_rows_to_csv(["Date", "Time In", "Time Out", "PC Used", "Status"], rows,
-                           default_name=f"attendance_{self.get('student_id')}.csv",
-                           parent=self)
+    # (Lab Attendance feature removed - Phase K/#14)
 
     # ----------------------------------------------------- announcements
     def _build_announcements_tab(self):

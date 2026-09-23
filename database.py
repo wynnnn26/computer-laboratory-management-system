@@ -75,11 +75,13 @@ CREATE TABLE IF NOT EXISTS computers (
     -- Client-side tracking fields
     ip_address TEXT,
     mac_address TEXT,
+    hostname TEXT,
     cpu_percent REAL DEFAULT 0,
     ram_percent REAL DEFAULT 0,
     last_heartbeat TEXT,
     client_version TEXT,
-    is_online INTEGER DEFAULT 0
+    is_online INTEGER DEFAULT 0,
+    admin_state TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS attendance (
@@ -234,7 +236,7 @@ def _migrate_legacy_schema(cur):
         """)
         print("[DB] Migrated users table (added 'staff' role support).")
 
-    # 2) computers table: LAN columns added in v2.0
+    # 2) computers table: LAN columns added in v2.0 / v2.1
     cols = [r[1] for r in cur.execute("PRAGMA table_info(computers)").fetchall()]
     for col, decl in [
         ("ip_address", "TEXT"),
@@ -244,6 +246,10 @@ def _migrate_legacy_schema(cur):
         ("last_heartbeat", "TEXT"),
         ("client_version", "TEXT"),
         ("is_online", "INTEGER DEFAULT 0"),
+        ("hostname", "TEXT"),
+        # JSON of the admin's desired state ({"cmd": "lock"/"pause", ...})
+        # so a lock/pause is re-applied when a client reconnects.
+        ("admin_state", "TEXT DEFAULT ''"),
     ]:
         if col not in cols:
             cur.execute(f"ALTER TABLE computers ADD COLUMN {col} {decl}")
@@ -299,8 +305,8 @@ def init_db():
         ("heartbeat_interval", "5", "Client heartbeat interval in seconds"),
         ("command_timeout", "30", "Command execution timeout in seconds"),
         ("screen_observe_interval", "1.0", "Screen observation capture interval (seconds)"),
-        ("screenshot_quality", "50", "JPEG quality for screenshots (1-100)"),
-        ("screenshot_scale", "0.5", "Screenshot scale factor (0.1-1.0)"),
+        ("screenshot_quality", "70", "JPEG quality for screenshots (1-100)"),
+        ("screenshot_scale", "0.75", "Screenshot scale factor (0.1-1.0)"),
         ("max_failed_logins", "5", "Max failed login attempts before lockout"),
         ("lockout_duration", "300", "Lockout duration in seconds"),
     ]
@@ -309,6 +315,13 @@ def init_db():
             "INSERT OR IGNORE INTO system_settings (key, value, description) VALUES (?,?,?)",
             (key, value, desc)
         )
+
+    # Migrate old small-preview screenshot defaults to readable ones
+    # (only when they still hold the previous default values).
+    cur.execute("UPDATE system_settings SET value='70' "
+                "WHERE key='screenshot_quality' AND value='50'")
+    cur.execute("UPDATE system_settings SET value='0.75' "
+                "WHERE key='screenshot_scale' AND value='0.5'")
 
     conn.commit()
     conn.close()

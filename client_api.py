@@ -69,16 +69,6 @@ def _local_borrow(sid):
     return {"ok": True, "data": [dict(r) for r in rows]}
 
 
-def _local_attendance(sid):
-    from database import get_connection
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM attendance WHERE student_id=? ORDER BY id DESC", (sid,)
-    ).fetchall()
-    conn.close()
-    return {"ok": True, "data": [dict(r) for r in rows]}
-
-
 def _local_pcs():
     from database import get_connection
     conn = get_connection()
@@ -116,54 +106,9 @@ def _local_borrow_submit(sid, item, qty):
     return {"ok": True, "data": []}
 
 
-def _local_time_in(sid, name, pc):
-    from database import get_connection
-    from utils import now_date, now_time
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT id FROM attendance WHERE student_id=? AND date=? AND status='In Lab'",
-        (sid, now_date()),
-    ).fetchone()
-    if row:
-        conn.close()
-        return {"ok": False, "error": "You already have an active lab session today."}
-    conn.execute(
-        "INSERT INTO attendance (student_id, full_name, pc_name, date, time_in, status) "
-        "VALUES (?,?,?,?,?, 'In Lab')",
-        (sid, name, pc, now_date(), now_time()),
-    )
-    conn.execute(
-        "UPDATE computers SET status='In Use', assigned_to=? WHERE pc_name=?", (sid, pc)
-    )
-    conn.commit()
-    conn.close()
-    return {"ok": True, "data": []}
-
-
-def _local_time_out(sid):
-    from database import get_connection
-    from utils import now_date, now_time
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT id, pc_name FROM attendance WHERE student_id=? AND date=? AND status='In Lab' "
-        "ORDER BY id DESC LIMIT 1",
-        (sid, now_date()),
-    ).fetchone()
-    if not row:
-        conn.close()
-        return {"ok": False, "error": "No active session to time out from."}
-    conn.execute(
-        "UPDATE attendance SET time_out=?, status='Completed' WHERE id=?", (now_time(), row["id"])
-    )
-    conn.execute(
-        "UPDATE computers SET status='Available', assigned_to='' WHERE pc_name=?", (row["pc_name"],)
-    )
-    conn.commit()
-    conn.close()
-    return {"ok": True, "data": []}
-
-
 # --------------------------------------------------------------- public API
+# NOTE: the Lab Attendance feature (time in / time out / attendance
+# history) was intentionally removed - Phase K/#14.
 def fetch_announcements():
     return _call("announcements", {}, _local_announcements)
 
@@ -189,21 +134,5 @@ def submit_borrow(student_id, item_name, quantity="1"):
                  lambda: _local_borrow_submit(student_id, item_name, quantity))
 
 
-def fetch_attendance(student_id):
-    return _call("attendance_list", {"student_id": student_id},
-                 lambda: _local_attendance(student_id))
-
-
 def fetch_available_pcs():
     return _call("pcs_available", {}, _local_pcs)
-
-
-def time_in(student_id, full_name, pc_name):
-    return _call("attendance_time_in",
-                 {"student_id": student_id, "full_name": full_name, "pc_name": pc_name},
-                 lambda: _local_time_in(student_id, full_name, pc_name))
-
-
-def time_out(student_id):
-    return _call("attendance_time_out", {"student_id": student_id},
-                 lambda: _local_time_out(student_id))

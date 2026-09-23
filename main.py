@@ -2,22 +2,47 @@
 main.py
 Entry point for the Computer Laboratory Management System (LAN Edition).
 
-Launcher offers two modes:
+Run modes:
   1. Server + Admin Console  – starts the central TCP/TLS LAN server and
      the original login window / dashboards on this (admin) PC.
   2. Client (Lab PC) Mode    – fullscreen mandatory-login kiosk that
      connects to the server, reports status, and obeys remote controls.
+
+Distribution (frozen builds - see build_exe.bat):
+  * server.exe  -> starts directly in Server/Admin mode (no mode prompt)
+  * client.exe  -> starts directly in Client mode
+Running from source (`python main.py`) shows the mode launcher; you can
+also force a mode with `python main.py --server` / `--client`.
 """
 
+import os
+import sys
 import queue
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 
 from database import init_db, get_connection, verify_password
 from utils import style_app, center_window, FONT_TITLE, FONT_LABEL
 from student_dashboard import StudentDashboard
 from admin_dashboard import AdminDashboard
 from server import LabServer, get_local_ip
+
+
+def _detected_mode():
+    """Choose the run mode without asking: command line first, then the
+    frozen executable name (server.exe / client.exe)."""
+    for arg in sys.argv[1:]:
+        if arg.lower() in ("--server", "-s"):
+            return "server"
+        if arg.lower() in ("--client", "-c"):
+            return "client"
+    if getattr(sys, "frozen", False):
+        name = os.path.splitext(os.path.basename(sys.executable))[0].lower()
+        if "server" in name:
+            return "server"
+        if "client" in name:
+            return "client"
+    return None
 
 
 # ==========================================================================
@@ -135,9 +160,17 @@ class LoginWindow(tk.Tk):
         pw_entry.pack(fill="x", padx=20)
         pw_entry.bind("<Return>", lambda e: self.attempt_login())
 
+        # Inline feedback instead of popup dialogs (non-blocking toasts /
+        # labels for normal events; dialogs are reserved for critical
+        # confirmations only).
+        self.err_lbl = tk.Label(card, text="", font=("Segoe UI", 9, "bold"),
+                                fg="#ff8585", bg="white", wraplength=340,
+                                justify="center")
+        self.err_lbl.pack(fill="x", padx=20)
+
         tk.Button(card, text="Login", command=self.attempt_login, bg="#2f6fed",
                   fg="white", font=("Segoe UI", 11, "bold"), relief="flat",
-                  pady=8, cursor="hand2").pack(fill="x", padx=20, pady=(20, 18))
+                  pady=8, cursor="hand2").pack(fill="x", padx=20, pady=(8, 18))
 
         if first_time:
             tk.Label(self,
@@ -146,16 +179,18 @@ class LoginWindow(tk.Tk):
                      font=("Segoe UI", 8), fg="#c7d2fe", bg="#1f2a44",
                      justify="center").pack(pady=(8, 0))
 
-        tk.Label(self, text="v2.0  |  LAN Laboratory Attendance & Resource Management",
+        tk.Label(self, text="v2.1  |  LAN Internet Cafe & Computer Lab PC Management",
                  font=("Segoe UI", 8), fg="#8e9bc4", bg="#1f2a44").pack(
             side="bottom", pady=8)
+
+    def _login_error(self, text):
+        self.err_lbl.config(text=text)
 
     def attempt_login(self):
         student_id = self.id_var.get().strip()
         password = self.pw_var.get()
         if not student_id or not password:
-            messagebox.showwarning("Missing information",
-                                   "Please enter both ID and password.")
+            self._login_error("Please enter both ID and password.")
             return
 
         conn = get_connection()
@@ -164,14 +199,16 @@ class LoginWindow(tk.Tk):
         conn.close()
 
         if not row or not verify_password(password, row["password"]):
-            messagebox.showerror("Login failed", "Invalid ID or password.")
+            self._login_error("Invalid ID or password.")
             return
         if row["status"] and row["status"].lower() == "inactive":
-            messagebox.showerror(
-                "Account inactive",
-                "This account has been deactivated. Contact the administrator.")
+            self._login_error("This account has been deactivated. "
+                              "Contact the administrator.")
             return
 
+        # Opens directly into the dashboard - no client-PC selection or
+        # other popups during login (Phase D/#1).
+        self._login_error("")
         self.withdraw()
         if row["role"] in ("admin", "staff"):
             AdminDashboard(self, row, on_logout=self.show_again,
@@ -182,6 +219,7 @@ class LoginWindow(tk.Tk):
     def show_again(self):
         self.id_var.set("")
         self.pw_var.set("")
+        self._login_error("")
         self.deiconify()
 
 
@@ -189,6 +227,7 @@ class LoginWindow(tk.Tk):
 # Entry point
 # ==========================================================================
 def run_server_mode():
+    from tkinter import messagebox
     init_db()
     events = queue.Queue()
     server = None
@@ -210,6 +249,17 @@ def run_server_mode():
 
 
 def main():
+    # Frozen server.exe / client.exe (and --server / --client) start
+    # directly in their mode without asking (Phase K/#1-2).
+    mode = _detected_mode()
+    if mode == "server":
+        run_server_mode()
+        return
+    if mode == "client":
+        from client import run_client
+        run_client()
+        return
+
     launcher = Launcher()
     launcher.mainloop()
     mode = launcher.mode

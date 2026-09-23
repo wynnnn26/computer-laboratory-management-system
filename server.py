@@ -37,8 +37,15 @@ CLIENT_VERSION = "2.0"
 # Certificate management (self-signed, generated once next to the DB)
 # --------------------------------------------------------------------------
 def ensure_certificates():
-    cert = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.crt")
-    key = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.key")
+    """Certificates live next to the running app (works both as .py and
+    as a frozen .exe, where __file__ points into the temp build folder)."""
+    import sys
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    cert = os.path.join(base_dir, "server.crt")
+    key = os.path.join(base_dir, "server.key")
     if not (os.path.exists(cert) and os.path.exists(key)):
         generate_self_signed_cert(cert, key)
     return cert, key
@@ -55,9 +62,8 @@ class ClientEntry:
         self.addr = addr
         self.pc_name = ""
         self.ip = addr[0]
-        self.mac = ""
-        self.specs = {}
-        self.status = "locked"            # locked / logged_in / idle / maintenance / paused
+        self.hostname = ""
+        self.status = "locked"            # locked / logged_in / idle / paused
         self.cpu_percent = 0.0
         self.ram_percent = 0.0
         self.logged_in_user = None
@@ -67,14 +73,15 @@ class ClientEntry:
         self.authenticated = False
         self.auth_role = None
         self.screen_streaming = False
+        self.desired = None                # admin's desired state (dict) or None
+        self._last_resync = 0.0
         self.lock = threading.Lock()
 
     def snapshot(self) -> dict:
         return {
             "pc_name": self.pc_name,
             "ip": self.ip,
-            "mac": self.mac,
-            "specs": self.specs,
+            "hostname": self.hostname,
             "status": self.status,
             "cpu_percent": round(self.cpu_percent, 1),
             "ram_percent": round(self.ram_percent, 1),
@@ -128,6 +135,22 @@ class LabServer:
         self.listener.listen(50)
         self.running = True
 
+        # Startup healing: no client can be connected yet, so every PC marked
+        # online and every session still open here is a leftover from a crash
+        # or an unclean shutdown. Close them so the dashboard never shows
+        # ghost "online" PCs or ghost "active" sessions.
+        try:
+            conn = get_connection()
+            conn.execute("UPDATE computers SET is_online=0")
+            conn.execute(
+                "UPDATE client_sessions SET logout_time=?, status='Disconnected' "
+                "WHERE logout_time IS NULL",
+                (now_datetime(),))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[SERVER] startup healing failed: {e}")
+
         t = threading.Thread(target=self._accept_loop, daemon=True, name="accept-loop")
         t.start()
         self.threads.append(t)
@@ -143,8 +166,18 @@ class LabServer:
     def stop(self):
         self.running = False
         with self.clients_lock:
-            for entry in list(self.clients.values()):
-                entry.close()
+            entries = list(self.clients.values())
+        # Unregister SYNCHRONOUSLY before closing the sockets: entry.close()
+        # clears the in-memory online flag, which would otherwise make the
+        # (daemon) connection thread skip the session/offline bookkeeping -
+        # or never run it at all if the process exits first.
+        for entry in entries:
+            try:
+                self._unregister(entry)
+            except Exception:
+                traceback.print_exc()
+            entry.close()
+        with self.clients_lock:
             self.clients.clear()
         for ev in list(self.screen_watchers.values()):
             ev.set()
@@ -276,24 +309,34 @@ class LabServer:
     def _on_register(self, entry, p):
         entry.pc_name = p.get("pc_name", entry.ip)
         entry.ip = p.get("ip", entry.ip)
-        entry.mac = p.get("mac", "")
-        entry.specs = p.get("specs", {})
+        entry.hostname = p.get("hostname", "") or socket.gethostname()
         entry.is_online = True
         entry.last_heartbeat = time.time()
 
         with self.clients_lock:
-            # Replace stale entry for same pc_name
+            # Replace stale entry for same pc_name (handles server/client
+            # restarts and duplicate registrations cleanly).
             old = self.clients.get(entry.pc_name)
             if old and old is not entry:
                 old.close()
             self.clients[entry.pc_name] = entry
 
         self._persist_computer(entry, online=1)
+        entry.desired = self._load_desired(entry.pc_name)
         self._emit("client_online", entry.snapshot())
+
+        # Re-apply an outstanding admin lock/pause after (re)connection so a
+        # restarted or reconnected client returns to the state the admin set.
+        if entry.desired:
+            self._resync(entry, initial=True)
 
     def _on_heartbeat(self, entry, p):
         if not entry.pc_name:
             entry.pc_name = p.get("pc_name", entry.ip)
+        if p.get("ip"):
+            entry.ip = p["ip"]
+        if p.get("hostname"):
+            entry.hostname = p["hostname"]
         entry.status = p.get("status", entry.status)
         entry.cpu_percent = p.get("cpu_percent", 0)
         entry.ram_percent = p.get("ram_percent", 0)
@@ -313,52 +356,138 @@ class LabServer:
         conn = get_connection()
         conn.execute(
             "UPDATE computers SET cpu_percent=?, ram_percent=?, last_heartbeat=?, "
+            "ip_address=COALESCE(NULLIF(?,''), ip_address), "
+            "hostname=COALESCE(NULLIF(?,''), hostname), "
             "status=CASE WHEN status IN ('Available','In Use') "
             "  THEN CASE WHEN ?='logged_in' THEN 'In Use' ELSE 'Available' END ELSE status END "
             "WHERE pc_name=?",
-            (entry.cpu_percent, entry.ram_percent, now_datetime(), entry.status, entry.pc_name),
+            (entry.cpu_percent, entry.ram_percent, now_datetime(),
+             entry.ip, entry.hostname, entry.status, entry.pc_name),
         )
         conn.commit()
         conn.close()
 
+        # Acknowledge the heartbeat: keeps the link provably alive on the
+        # client AND carries the authoritative admin state for synchronization.
+        from protocol import build_heartbeat_ack
+        entry.send(build_heartbeat_ack(
+            json.dumps(entry.desired) if entry.desired else ""))
+
+        # Reconcile desired state (server is the source of truth).
+        if entry.desired:
+            self._resync(entry)
+
         self._emit("client_heartbeat", entry.snapshot())
+
+    # -------------------------------------------- desired admin state sync
+    def _load_desired(self, pc_name):
+        try:
+            conn = get_connection()
+            row = conn.execute(
+                "SELECT admin_state FROM computers WHERE pc_name=?",
+                (pc_name,)).fetchone()
+            conn.close()
+            if row and row["admin_state"]:
+                return json.loads(row["admin_state"])
+        except Exception:
+            pass
+        return None
+
+    def _save_desired(self, pc_name, desired):
+        """Persist the admin's desired lock/pause state for a PC (or clear it)."""
+        self._persist_admin_state(pc_name, json.dumps(desired) if desired else "")
+        with self.clients_lock:
+            entry = self.clients.get(pc_name)
+            if entry:
+                entry.desired = desired or None
+
+    def _persist_admin_state(self, pc_name, state_json):
+        try:
+            conn = get_connection()
+            conn.execute(
+                "UPDATE computers SET admin_state=? WHERE pc_name=?",
+                (state_json, pc_name))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[SERVER] admin_state persist failed: {e}")
+
+    def _resync(self, entry, initial=False):
+        """Re-send the desired command if the client's state does not match.
+        Throttled so a non-complying client cannot flood the audit log."""
+        desired = entry.desired
+        if not desired:
+            return
+        cmd = desired.get("cmd")
+        status = entry.status
+        matches = ((cmd == "lock" and status == "locked") or
+                   (cmd == "pause" and status == "paused"))
+        if matches and not initial:
+            return
+        if not initial:
+            if time.time() - entry._last_resync < 15:
+                return
+            if matches:
+                return
+        entry._last_resync = time.time()
+        mtype = {"lock": MessageType.CMD_LOCK,
+                 "pause": MessageType.CMD_PAUSE}.get(cmd)
+        if not mtype:
+            return
+        self.send_command(mtype, entry.pc_name, desired.get("params", {}),
+                          admin_user="system", wait_response=False)
+        print(f"[SERVER] Resync {cmd} -> {entry.pc_name}")
 
     def _persist_computer(self, entry: ClientEntry, online: int):
         conn = get_connection()
         row = conn.execute("SELECT id FROM computers WHERE pc_name=?", (entry.pc_name,)).fetchone()
-        specs_str = json.dumps(entry.specs) if entry.specs else ""
         if row:
             conn.execute(
-                "UPDATE computers SET ip_address=?, mac_address=?, client_version=?, "
+                "UPDATE computers SET ip_address=?, hostname=?, client_version=?, "
                 "is_online=?, last_heartbeat=? WHERE pc_name=?",
-                (entry.ip, entry.mac, CLIENT_VERSION, online, now_datetime(), entry.pc_name),
+                (entry.ip, entry.hostname, CLIENT_VERSION, online,
+                 now_datetime(), entry.pc_name),
             )
         else:
             conn.execute(
-                "INSERT INTO computers (pc_name, specs, location, status, ip_address, mac_address, "
-                "client_version, is_online, last_heartbeat) VALUES (?,?,?,?,?,?,?,?,?)",
-                (entry.pc_name, specs_str, "Lab", "Available",
-                 entry.ip, entry.mac, CLIENT_VERSION, online, now_datetime()),
+                "INSERT INTO computers (pc_name, location, status, ip_address, hostname, "
+                "client_version, is_online, last_heartbeat) VALUES (?,?,?,?,?,?,?,?)",
+                (entry.pc_name, "Lab", "Available",
+                 entry.ip, entry.hostname, CLIENT_VERSION, online, now_datetime()),
             )
         conn.commit()
         conn.close()
 
     def _unregister(self, entry: ClientEntry):
+        """Detach a client: drop it from the registry, mark the PC offline in
+        the DB and close any session it still owns.
+
+        Idempotent (may be called from stop(), the connection thread and the
+        sweep). Skips the DB writes when a newer connection has already
+        replaced this entry for the same PC - that entry now owns the row.
+        """
         with self.clients_lock:
-            if entry.pc_name and self.clients.get(entry.pc_name) is entry:
+            is_current = bool(entry.pc_name) and self.clients.get(entry.pc_name) is entry
+            if is_current:
                 del self.clients[entry.pc_name]
-        if entry.is_online and entry.pc_name:
-            conn = get_connection()
-            conn.execute("UPDATE computers SET is_online=0 WHERE pc_name=?", (entry.pc_name,))
-            # Close any open session on this PC
-            if entry.session_id:
-                conn.execute(
-                    "UPDATE client_sessions SET logout_time=?, status='Disconnected' "
-                    "WHERE session_id=? AND logout_time IS NULL",
-                    (now_datetime(), entry.session_id),
-                )
-            conn.commit()
-            conn.close()
+        if not entry.pc_name or not is_current:
+            return
+        conn = get_connection()
+        conn.execute("UPDATE computers SET is_online=0 WHERE pc_name=?", (entry.pc_name,))
+        # Close every session still open on this PC: the connection that
+        # owned them is gone. Matched by pc_name (not entry.session_id)
+        # because heartbeats continuously overwrite that field - a logged-out
+        # client clears it while its session row may still be open.
+        conn.execute(
+            "UPDATE client_sessions SET logout_time=?, status='Disconnected' "
+            "WHERE logout_time IS NULL AND pc_name=?",
+            (now_datetime(), entry.pc_name),
+        )
+        entry.session_id = None
+        conn.commit()
+        conn.close()
+        if entry.is_online:
+            entry.is_online = False
             self._emit("client_offline", {"pc_name": entry.pc_name})
 
     # ------------------------------------------------------------- auth
@@ -394,9 +523,9 @@ class LabServer:
         entry.authenticated = True
         entry.auth_role = row["role"]
 
-        # Record client info
-        if client_info:
-            entry.specs.update(client_info)
+        # Record client info (no hardware specs are collected)
+        if client_info and client_info.get("hostname"):
+            entry.hostname = client_info["hostname"]
 
         self._log_activity(username, "login_success", entry.pc_name or entry.ip,
                            f"{row['full_name']} logged in ({row['role']})", entry.ip)
@@ -415,26 +544,38 @@ class LabServer:
     # ----------------------------------------------------------- sessions
     def _on_session_start(self, entry, p):
         sid = p.get("session_id") or uuid.uuid4().hex[:12]
+        pc = p.get("pc_name", entry.pc_name)
+        user = p.get("student_id", "")
         conn = get_connection()
+        # Self-heal: close any session left open for this PC or this user
+        # (crash, power loss, unclean shutdown) so no ghost "Active" rows
+        # survive into the new session.
+        if user:
+            conn.execute(
+                "UPDATE client_sessions SET logout_time=?, status='Disconnected' "
+                "WHERE logout_time IS NULL AND (pc_name=? OR student_id=?)",
+                (now_datetime(), pc, user),
+            )
+        else:
+            conn.execute(
+                "UPDATE client_sessions SET logout_time=?, status='Disconnected' "
+                "WHERE logout_time IS NULL AND pc_name=?",
+                (now_datetime(), pc),
+            )
         conn.execute(
             "INSERT OR REPLACE INTO client_sessions "
             "(session_id, pc_name, student_id, full_name, login_time, ip_address, status) "
             "VALUES (?,?,?,?,?,?, 'Active')",
-            (sid, p.get("pc_name", entry.pc_name), p.get("student_id", ""),
+            (sid, pc, user,
              p.get("full_name", ""), datetime.fromtimestamp(p.get("start_time", time.time()))
                  .strftime("%Y-%m-%d %H:%M:%S"),
              entry.ip),
         )
-        # Also create attendance record (In Lab)
-        conn.execute(
-            "INSERT INTO attendance (student_id, full_name, pc_name, date, time_in, status) "
-            "VALUES (?,?,?,?,?, 'In Lab')",
-            (p.get("student_id", ""), p.get("full_name", ""),
-             p.get("pc_name", entry.pc_name), now_date(), now_time()),
-        )
+        # NOTE: the Lab Attendance feature was intentionally removed - only
+        # the PC session record is kept (Internet Cafe PC management focus).
         conn.execute(
             "UPDATE computers SET status='In Use', assigned_to=? WHERE pc_name=?",
-            (p.get("student_id", ""), p.get("pc_name", entry.pc_name)),
+            (user, pc),
         )
         conn.commit()
         conn.close()
@@ -465,13 +606,7 @@ class LabServer:
             "WHERE session_id=?",
             (end.strftime("%Y-%m-%d %H:%M:%S"), duration or 0, sid),
         )
-        # Attendance time-out (close the most recent open record for today)
-        conn.execute(
-            "UPDATE attendance SET time_out=?, status='Completed' "
-            "WHERE id=(SELECT id FROM attendance WHERE student_id=? AND date=? AND status='In Lab' "
-            "ORDER BY id DESC LIMIT 1)",
-            (now_time(), row["student_id"] if row else "", now_date()),
-        )
+        # (Lab Attendance feature removed - no attendance bookkeeping.)
         if row:
             conn.execute(
                 "UPDATE computers SET status='Available', assigned_to='' WHERE pc_name=?",
@@ -534,58 +669,14 @@ class LabServer:
                 conn.commit()
 
             elif kind == "attendance_list":
-                rows = conn.execute(
-                    "SELECT * FROM attendance WHERE student_id=? ORDER BY id DESC",
-                    (d.get("student_id", ""),),
-                ).fetchall()
-                data = [dict(r) for r in rows]
+                # Lab Attendance feature removed - kept as a safe no-op.
+                ok, err = False, "Lab Attendance is not available."
 
             elif kind == "attendance_time_in":
-                sid = d.get("student_id", "")
-                existing = conn.execute(
-                    "SELECT id FROM attendance WHERE student_id=? AND date=? AND status='In Lab'",
-                    (sid, now_date()),
-                ).fetchone()
-                if existing:
-                    ok, err = False, "You already have an active lab session today."
-                else:
-                    pc = d.get("pc_name", "")
-                    pc_row = conn.execute(
-                        "SELECT status FROM computers WHERE pc_name=?", (pc,)
-                    ).fetchone()
-                    if not pc_row or pc_row["status"] != "Available":
-                        ok, err = False, f"{pc} is not available."
-                    else:
-                        conn.execute(
-                            "INSERT INTO attendance (student_id, full_name, pc_name, date, "
-                            "time_in, status) VALUES (?,?,?,?,?, 'In Lab')",
-                            (sid, d.get("full_name", ""), pc, now_date(), now_time()),
-                        )
-                        conn.execute(
-                            "UPDATE computers SET status='In Use', assigned_to=? WHERE pc_name=?",
-                            (sid, pc),
-                        )
-                        conn.commit()
+                ok, err = False, "Lab Attendance is not available."
 
             elif kind == "attendance_time_out":
-                sid = d.get("student_id", "")
-                row = conn.execute(
-                    "SELECT id, pc_name FROM attendance WHERE student_id=? AND date=? "
-                    "AND status='In Lab' ORDER BY id DESC LIMIT 1",
-                    (sid, now_date()),
-                ).fetchone()
-                if not row:
-                    ok, err = False, "No active session to time out from."
-                else:
-                    conn.execute(
-                        "UPDATE attendance SET time_out=?, status='Completed' WHERE id=?",
-                        (now_time(), row["id"]),
-                    )
-                    conn.execute(
-                        "UPDATE computers SET status='Available', assigned_to='' WHERE pc_name=?",
-                        (row["pc_name"],),
-                    )
-                    conn.commit()
+                ok, err = False, "Lab Attendance is not available."
 
             elif kind == "pcs_available":
                 rows = conn.execute(
@@ -636,15 +727,30 @@ class LabServer:
             with self._pending_cv:
                 self._pending_results[cid] = p
                 self._pending_cv.notify_all()
+        success = bool(p.get("success"))
         conn = get_connection()
+        row = None
+        if cid:
+            row = conn.execute(
+                "SELECT command_type, target_pc, admin_user FROM client_commands "
+                "WHERE command_id=?", (cid,)).fetchone()
         conn.execute(
             "UPDATE client_commands SET status=?, result=?, executed_at=? WHERE command_id=?",
-            ("Done" if p.get("success") else "Failed",
+            ("Done" if success else "Failed",
              json.dumps(p.get("result") if p.get("result") is not None else p.get("error", "")),
              now_datetime(), cid),
         )
         conn.commit()
         conn.close()
+
+        # Explicit audit for the critical power actions: admin, target PC,
+        # timestamp, command and result (Phase B - shutdown/restart safety).
+        if row and row["command_type"] in ("cmd_restart", "cmd_shutdown"):
+            self._log_activity(
+                row["admin_user"] or "system", row["command_type"],
+                row["target_pc"],
+                f"result={'OK' if success else 'FAILED'} "
+                f"{p.get('result') or p.get('error') or ''}".strip())
         self._emit("cmd_response", p)
 
     def _on_screenshot(self, entry, msg, p):
@@ -692,6 +798,16 @@ class LabServer:
 
         if not entry.send(msg):
             return {"success": False, "error": "Send failed", "command_id": command_id}
+
+        # Track the admin's desired state so it survives client restarts and
+        # server/client reconnects (lock is cleared by unlock, pause only by
+        # an explicit resume - never automatically).
+        if cmd == MessageType.CMD_LOCK:
+            self._save_desired(target_pc, {"cmd": "lock", "params": params or {}})
+        elif cmd == MessageType.CMD_PAUSE:
+            self._save_desired(target_pc, {"cmd": "pause", "params": params or {}})
+        elif cmd in (MessageType.CMD_UNLOCK, MessageType.CMD_RESUME):
+            self._save_desired(target_pc, None)
 
         if not wait_response:
             return {"success": True, "command_id": command_id}
@@ -768,6 +884,49 @@ class LabServer:
         return self.send_command(MessageType.CMD_SEND_MESSAGE, pc,
                                  {"message": text, "msg_type": msg_type}, admin)
 
+    def force_logout_user(self, student_id, admin="", reason="") -> dict:
+        """Log a user out of any active client session.
+
+        Called automatically when an account is deleted, disabled or
+        updated so stale sessions never survive account changes.
+        """
+        if not student_id:
+            return {"success": True, "forced": 0}
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT session_id, pc_name, login_time FROM client_sessions "
+            "WHERE student_id=? AND logout_time IS NULL", (student_id,)).fetchall()
+        conn.close()
+        forced = 0
+        for r in rows:
+            # Tell the client to return to the login screen (no wait - the
+            # PC may be offline; the session row is closed either way).
+            self.send_command(MessageType.CMD_LOGOUT, r["pc_name"], {},
+                              admin or "system", wait_response=False)
+            duration = 0
+            try:
+                start = datetime.strptime(r["login_time"], "%Y-%m-%d %H:%M:%S")
+                duration = int((datetime.now() - start).total_seconds())
+            except Exception:
+                pass
+            conn = get_connection()
+            conn.execute(
+                "UPDATE client_sessions SET logout_time=?, duration_seconds=?, "
+                "status='Forced Logout' WHERE session_id=?",
+                (now_datetime(), duration, r["session_id"]))
+            conn.execute(
+                "UPDATE computers SET status='Available', assigned_to='' "
+                "WHERE pc_name=? AND assigned_to=?", (r["pc_name"], student_id))
+            conn.commit()
+            conn.close()
+            forced += 1
+        if forced:
+            self._log_activity(admin or "system", "force_logout", student_id,
+                               f"{reason} ({forced} session(s))")
+            self._emit("session_forced", {"student_id": student_id,
+                                          "count": forced})
+        return {"success": True, "forced": forced}
+
     def request_screenshot(self, pc, admin="", quality=None, scale=None) -> dict:
         from protocol import build_screenshot_request
         entry = self.get_client(pc)
@@ -788,13 +947,15 @@ class LabServer:
                 if req.msg_id in self._pending_screens:
                     data = self._pending_screens.pop(req.msg_id)
                     self._audit_done(cid, True, "frame captured")
+                    self._log_activity(admin, "screenshot", pc, "frame captured")
                     return {"success": True, "data": data}
                 self._pending_cv.wait(0.3)
         self._audit_done(cid, False, "timeout")
+        self._log_activity(admin, "screenshot", pc, "FAILED: timeout")
         return {"success": False, "error": "Screenshot timeout"}
 
     def start_screen_observe(self, pc, admin="", interval=1.0,
-                             quality=30, scale=0.4) -> bool:
+                             quality=50, scale=0.6) -> bool:
         from protocol import build_screen_observe_start
         entry = self.get_client(pc)
         if not entry or not entry.is_online:
