@@ -73,7 +73,7 @@ decides which one it is; nothing else needs to change.
 | Wire protocol | `protocol.py` | `MessageType` enum (:19), `Message` framing (:103), TLS helpers (:210), self-signed cert generation (:228), message builders (:281-565) |
 | Server database | `database.py` | Schema (:58-241), migrations (:244), PBKDF2 hashing (:40), seeding + settings (:408-516) |
 | Client database | `local_store.py` | Offline log queue + auth roster cache (:64-384) |
-| Website Access | `web_access.py`, `dns_filter.py` | Connection→domain detection & guarded close (:300); pure verdict engine + DNS repair (:84, :282) |
+| Website Access | `web_access.py`, `dns_filter.py` | Connection→domain detection & guarded close (:330); pure verdict engine + DNS repair (:84, :282) |
 | Admin UI | `admin_dashboard.py` (3.7k lines) | `AdminDashboard` console (:168) — sidebar + 13 pages + remote controls |
 | Student UI | `student_dashboard.py` | Announcements / messages / borrowing (:38) |
 | Data bridge | `client_api.py` | Network-first fetches for the student UI with SQLite fallback (:17) |
@@ -319,11 +319,18 @@ command), startup/watchdog registration, and an uninstall path
    (`dns_filter.repair_adapter_dns` :282), then stores the policy and
    starts enforcement. On startup, **DNS repair runs before the saved
    policy is re-applied** (`_startup_web_policy` :888).
-4. **Enforcement:** `WebAccessDetector` (`web_access.py:300`) resolves live
-   connections to domains (`resolve_domain` :188), asks the shared verdict
+4. **Enforcement:** `WebAccessDetector` (`web_access.py:330`) maps live
+   connections to domains, asks the shared verdict
    engine (`dns_filter.decide` :84 / `domain_matches` :75) and performs a
-   **guarded browser close** (`close_browser` :701) — it verifies the
-   process and window before acting.
+   **guarded browser close** (`close_browser` :736) — it verifies the
+   process and window before acting. Address coverage is deliberately
+   broad so a real visit can actually be matched: `resolve_domain`
+   (:188) maps the **union of the upstream and system resolver views**
+   (browsers resolve through the system path or DoH; the views differ
+   for common sites), and each rule also resolves its **www/apex entry
+   point** (`_lookup_candidates` :304 — typing `youtube.com` lands the
+   browser on `www.youtube.com`, whose address pool is disjoint from
+   the apex), with every address attributed to the rule domain.
 5. **Ack:** the client answers `WEB_POLICY_ACK` with the version (or a
    failure reason); the server only marks a PC **SYNCED** on a matching ack
    (`_on_web_policy_ack`, `server.py:1677`), shown live in the Policy

@@ -831,6 +831,85 @@ check("[web] both rule lists are watched (shared addresses stay detectable)",
 _detw.stop()
 _det.stop()
 
+# ---- P1.5: the two coverage gaps that made real blocking silently fail --
+# (a) a bare rule must also watch its www entry point: typing
+#     youtube.com lands the browser on www.youtube.com, whose address
+#     pool is DISJOINT from the apex - a connection to it could never be
+#     matched.  _watch stays the rule list itself (pinned above); the
+#     variant is a refresh-time lookup candidate, and every address it
+#     learns is attributed to the RULE domain.
+# (b) resolve_domain must map BOTH resolver views (upstream + system),
+#     because the browser resolves through the system path.
+_calls = []
+
+
+def _res_www(dom, upstream=None):
+    _calls.append(dom)
+    return {"bad.example": ["203.0.113.5"],
+            "www.bad.example": ["198.51.100.9"]}.get(dom, ())
+
+
+_detv = _wa.WebAccessDetector(resolver=_res_www,
+                              connections=lambda: [("198.51.100.9", 4242,
+                                                    "ESTABLISHED")])
+_detv.set_policy({"version": 1, "mode": "block_list",
+                  "blocked": ["bad.example"], "allowed": [],
+                  "upstream_dns": ""})
+_detv.stop()
+_detv.refresh()
+check("[web] a rule also resolves its www entry point, attributed to the rule",
+      "www.bad.example" in _calls and _detv._watch == ["bad.example"]
+      and _detv._ip_map.get("198.51.100.9") == {"bad.example"},
+      f"{_calls},{_detv._ip_map}")
+_ev = _detv.poll()
+check("[web] a browser on the www pool is DETECTED for the bare rule",
+      len(_ev) == 1 and _ev[0]["status"] == "DETECTED"
+      and _ev[0]["domain"] == "bad.example"
+      and _ev[0]["reason"] == "blocked", str(_ev))
+_detv.stop()
+
+# the symmetric direction: a rule copied WITH www. still matches the apex
+_calls = []
+
+
+def _res_apex(dom, upstream=None):
+    _calls.append(dom)
+    return {"www.x.example": ["203.0.113.6"],
+            "x.example": ["198.51.100.4"]}.get(dom, ())
+
+
+_detv = _wa.WebAccessDetector(resolver=_res_apex,
+                              connections=lambda: [("198.51.100.4", 4242,
+                                                    "ESTABLISHED")])
+_detv.set_policy({"version": 1, "mode": "block_list",
+                  "blocked": ["www.x.example"], "allowed": [],
+                  "upstream_dns": ""})
+_detv.stop()
+_detv.refresh()
+_ev = _detv.poll()
+check("[web] a www-prefixed rule still matches the apex host",
+      "x.example" in _calls and len(_ev) == 1
+      and _ev[0]["status"] == "DETECTED"
+      and _ev[0]["domain"] == "www.x.example", f"{_calls},{_ev}")
+_detv.stop()
+
+# resolve_domain: upstream answers AND the system view, unioned
+_pkt = (_struct.pack("!HHHHHH", 0x1111, 0x8180, 1, 1, 0, 0)
+        + b"\x06x\x04test\x00" + _struct.pack("!HH", 1, 1)
+        + b"\xc0\x0c" + _struct.pack("!HHIH", 1, 1, 60, 4)
+        + socket.inet_aton("203.0.113.5"))
+_raw_orig, _gai_orig = _wa._raw_query, socket.getaddrinfo
+try:
+    _wa._raw_query = lambda server, name, qtype, timeout=2.0: (
+        _pkt if qtype == 1 else None)
+    socket.getaddrinfo = lambda *a, **k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.9", 0))]
+    _union = _wa.resolve_domain("test.example", upstream="9.9.9.9")
+finally:
+    _wa._raw_query, socket.getaddrinfo = _raw_orig, _gai_orig
+check("[web] resolve_domain maps the upstream AND the system view",
+      _union == {"203.0.113.5", "198.51.100.9"}, str(_union))
+
 # a real connection to a blocked address -> one DETECTED event, and the
 # same still-open connection must not be reported over and over
 _det, _ = _mk_wa("block_list", blocked=["bad.example"],

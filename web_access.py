@@ -186,11 +186,18 @@ def _raw_query(server, name, qtype, timeout=2.0):
 
 
 def resolve_domain(name, upstream=None, timeout=2.0):
-    """All A/AAAA addresses for a hostname.
+    """All A/AAAA addresses for a hostname: the UNION of both views.
 
-    Tries our own query to `upstream_dns` first (per the P1 decision:
-    upstream_dns is the Client's lookup resolver and NOTHING else), then
-    falls back to the system resolver.  Returns a set - never raises."""
+    A browser resolves through the SYSTEM resolver (or DoH, whose view
+    matches a public upstream), while this Client asks `upstream_dns`
+    directly (per the P1 decision: upstream_dns is the Client's lookup
+    resolver and NOTHING else).  The two views genuinely differ for
+    common sites - x.com, tiktok.com and accounts.google.com each
+    resolved to DISJOINT address sets per view - so mapping only the
+    upstream answer let the browser connect to an address the detector
+    never learned: no match, no event, and blocking silently did
+    nothing.  Both views are therefore always collected; returns a set
+    - never raises."""
     name = normalize(name)
     found = set()
     if upstream and name:
@@ -198,8 +205,8 @@ def resolve_domain(name, upstream=None, timeout=2.0):
             for _t, addr in parse_answers(
                     _raw_query(upstream, name, qtype, timeout)):
                 found.add(addr)
-    if found:
-        return found
+    # the system view is ALWAYS included - upstream answering must no
+    # longer short-circuit it (that skip was the missed connection)
     try:
         for _family, _type, _proto, _canon, sa in socket.getaddrinfo(
                 name or "localhost", None):
@@ -292,6 +299,29 @@ def browser_root(pid):
         return int(root.pid), root_name
     except Exception:
         return 0, ""
+
+
+def _lookup_candidates(dom):
+    """Hosts to resolve for ONE rule domain.
+
+    The address bar does not use the rule's exact host: typing
+    youtube.com lands the browser on www.youtube.com, and the two hosts
+    serve DISJOINT address pools (measured for youtube.com,
+    facebook.com and tiktok.com).  Resolving only the rule's own host
+    therefore let the very connection that visits the blocked site go
+    unseen - no match, no event, the browser stayed open and blocking
+    looked broken.  The rule and its www/apex counterpart are both
+    resolved, and every address learned is attributed to the RULE
+    domain, so the verdict is still decide()'s on the rule the
+    administrator wrote (suffix semantics unchanged)."""
+    dom = normalize(dom)
+    if not dom:
+        return []
+    out = [dom]
+    variant = dom[4:] if dom.startswith("www.") else "www." + dom
+    if variant and "." in variant and variant not in out:
+        out.append(variant)
+    return out
 
 
 # ==========================================================================
@@ -414,8 +444,9 @@ class WebAccessDetector:
 
     # --------------------------------------------------------- resolution
     def refresh(self, force=True):
-        """Re-resolve every watched domain.  Returns how many addresses
-        were learned.  Never raises."""
+        """Re-resolve every watched rule domain AND its entry-point
+        variant (the _lookup_candidates www/apex pair).  Returns how
+        many addresses were learned.  Never raises."""
         with self._lock:
             watch = list(self._watch)
             upstream = self._policy.get("upstream_dns") or None
@@ -428,14 +459,18 @@ class WebAccessDetector:
             return 0
         ip_map, learned = {}, 0
         for dom in watch:
-            addrs = self._resolver(dom, upstream) \
-                if _takes_upstream(self._resolver) \
-                else self._resolver(dom)
-            for ip in {_clean_ip(a) for a in (addrs or set())}:
-                if not ip:
-                    continue
-                ip_map.setdefault(ip, set()).add(dom)
-                learned += 1
+            for host in _lookup_candidates(dom):
+                addrs = self._resolver(host, upstream) \
+                    if _takes_upstream(self._resolver) \
+                    else self._resolver(host)
+                for ip in {_clean_ip(a) for a in (addrs or set())}:
+                    if not ip:
+                        continue
+                    # attributed to the RULE domain: whatever host the
+                    # browser really opened, the verdict + reported
+                    # domain are the rule the administrator wrote
+                    ip_map.setdefault(ip, set()).add(dom)
+                    learned += 1
         with self._lock:
             self._ip_map = ip_map
             self._dirty = False
