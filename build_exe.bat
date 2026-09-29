@@ -22,11 +22,13 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
 echo.
+REM pystray picks its OS backend with a dynamic import, so list the Windows
+REM one explicitly (client.exe only - the tray belongs to the Client).
 echo Building server.exe (Server + Admin Console - opens directly in Server mode)...
-python -m PyInstaller --noconfirm --onefile --windowed --name "server" main.py
+python -m PyInstaller --noconfirm --onefile --windowed --name "server" --icon "app_icon.ico" --add-data "app_icon.ico;." --add-data "assets;assets" --add-data "pc_icons;pc_icons" --collect-all customtkinter main.py
 
 echo Building client.exe (Client kiosk - opens directly in Client mode)...
-python -m PyInstaller --noconfirm --onefile --windowed --name "client" main.py
+python -m PyInstaller --noconfirm --onefile --windowed --name "client" --icon "app_icon.ico" --add-data "app_icon.ico;." --add-data "assets;assets" --add-data "pc_icons;pc_icons" --collect-all customtkinter --hidden-import "pystray._win32" --hidden-import "pystray._util.win32" main.py
 
 echo.
 echo ============================================================

@@ -1,0 +1,12 @@
+# runtime / generated artifacts
+__pycache__/
+*.py[cod]
+lab_system.db*
+lab_client.db*
+lab_config.json
+server.crt
+server.key
+build/
+*.spec
+_run_*/
+Thumbs.db

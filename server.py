@@ -23,14 +23,93 @@ import threading
 import traceback
 from datetime import datetime
 
-from database import get_connection, verify_password, get_setting
+from database import (get_connection, verify_password, get_setting,
+                      hash_password, DEFAULT_CLIENT_PASSWORD)
 from utils import now_date, now_time, now_datetime
 from protocol import (
     Message, MessageType, TLSSocketWrapper, create_ssl_context,
-    generate_self_signed_cert,
+    generate_self_signed_cert, DISCOVER_MAGIC, REPLY_MAGIC,
+    discovery_udp_port,
 )
 
 CLIENT_VERSION = "2.0"
+
+# Seconds without a reconnect after a network disconnect before the event
+# is escalated to a Client Crash in the audit trail (P3 event taxonomy:
+# Normal Logout / Client Closed / Client Crash / Network Disconnect).
+CRASH_GRACE_SECONDS = 30
+
+
+# --------------------------------------------------------------------------
+# Authoritative PC status engine (single source of truth for every UI)
+# --------------------------------------------------------------------------
+# Priority (highest first): OFFLINE > VERIFYING > LOCKED > PAUSED >
+# IN USE > AVAILABLE > ONLINE, with UNKNOWN as the final fallback.
+# Keys match utils.STATUS_LABELS / pc_icons/<key>.png.
+STATUS_PRIORITY = ("offline", "verifying", "locked", "paused", "in_use",
+                   "available", "online", "unknown")
+
+
+def _field(obj, key, default=None):
+    """Read `key` from a ClientEntry, dict or sqlite3.Row."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    try:
+        return obj[key]
+    except (IndexError, KeyError, TypeError):
+        return getattr(obj, key, default)
+
+
+def derive_status(entry=None, row=None) -> str:
+    """Compute the single authoritative status for one PC.
+
+    A live ClientEntry (or a dict with the same fields) always takes
+    precedence; the database row is the fallback when no connection exists
+    (ever-connected rows -> OFFLINE, never-connected rows -> UNKNOWN).
+
+    Priority: OFFLINE > VERIFYING > LOCKED > PAUSED > IN USE > AVAILABLE >
+    ONLINE, UNKNOWN only when nothing at all can be determined.  The
+    dashboard renders exactly this value - it never guesses a status.
+    """
+    if entry is None:
+        if row is None:
+            return "unknown"
+        if not _field(row, "is_online", 0) and not _field(row, "last_heartbeat", None):
+            return "unknown"              # never connected - state unknown
+        return "offline"                  # known PC, but no live connection
+    # 1) OFFLINE wins over every other state
+    if not bool(_field(entry, "is_online", False)):
+        return "offline"
+    # 2) VERIFYING: connecting / reconnecting / authenticating
+    if bool(_field(entry, "verifying", False)):
+        return "verifying"
+    desired = _field(entry, "desired", None) or {}
+    if isinstance(desired, str):
+        try:
+            desired = json.loads(desired) if desired else {}
+        except Exception:
+            desired = {}
+    cmd = desired.get("cmd") if isinstance(desired, dict) else None
+    # 3) LOCKED: an admin lock is outstanding (Unlock/Force Login clears it)
+    if cmd == "lock":
+        return "locked"
+    status = str(_field(entry, "status", "") or "")
+    # 4) PAUSED: admin pause (never auto-expires) or client-reported pause
+    if cmd == "pause" or status == "paused":
+        return "paused"
+    # 5) IN USE: a user session is active on this PC
+    if _field(entry, "logged_in_user", None) or status == "logged_in":
+        return "in_use"
+    # 6) AVAILABLE: connected, nobody logged in, kiosk ready for login
+    if status in ("locked", "idle", ""):
+        return "available"
+    # 7) ONLINE: connected, state not further classified
+    if bool(_field(entry, "is_online", False)):
+        return "online"
+    # 8) UNKNOWN fallback
+    return "unknown"
 
 
 # --------------------------------------------------------------------------
@@ -72,6 +151,23 @@ class ClientEntry:
         self.last_heartbeat = time.time()
         self.authenticated = False
         self.auth_role = None
+        # Server-validated identity of the last successful AUTH (never
+        # client-claimed) - used to harden session_start and to display the
+        # account type of the current session.
+        self.auth_user = None
+        self.auth_full_name = None
+        # FIRST LOGIN PASSWORD: while True, this entry's account must
+        # still replace its default password - session_start is refused
+        # until the change is confirmed by the server.
+        self.must_change_password = False
+        # Active-session account info, refreshed from the DB at session_start
+        self.account_role = None
+        self.account_full_name = None
+        # VERIFYING: set at (re)register and during auth, cleared by the
+        # first heartbeat (or when the auth exchange finishes).
+        self.verifying = True
+        # Last state emitted through _emit_state() -> status_changed events
+        self._last_state = ""
         self.screen_streaming = False
         self.desired = None                # admin's desired state (dict) or None
         self._last_resync = 0.0
@@ -83,12 +179,19 @@ class ClientEntry:
             "ip": self.ip,
             "hostname": self.hostname,
             "status": self.status,
+            # Authoritative display state + session account info (set by the
+            # server only; never client-claimed; no passwords anywhere).
+            "state": derive_status(self),
+            "account_role": self.account_role or self.auth_role or "",
+            "account_full_name": self.account_full_name or self.auth_full_name or "",
             "cpu_percent": round(self.cpu_percent, 1),
             "ram_percent": round(self.ram_percent, 1),
             "logged_in_user": self.logged_in_user or "",
             "session_id": self.session_id or "",
             "is_online": self.is_online,
             "last_heartbeat": datetime.fromtimestamp(self.last_heartbeat).strftime("%H:%M:%S"),
+            "verifying": self.verifying,
+            "admin_cmd": (self.desired or {}).get("cmd", "") if isinstance(self.desired, dict) else "",
         }
 
     def send(self, msg: Message) -> bool:
@@ -117,9 +220,22 @@ class LabServer:
         self.server_ssl = None
         self.threads = []
         self.screen_watchers = {}         # pc_name -> stop Event
+        # Task 5: one ACTIVE remote-control session per PC at most.
+        # pc_name -> {"admin", "session_id", "started_at"}; guarded by its
+        # own lock because input forwarding happens on reader threads.
+        self.remote_sessions = {}
+        self._remote_lock = threading.Lock()
+        # P4: which (pc, role) refusals have already been audited, so the
+        # hot path - one input batch per mouse move - cannot drown the
+        # trail the way a row per movement would.  Bounded, and never
+        # trusted for anything: refusing does not depend on it.
+        self._remote_reject_seen = set()
         self._pending_screens = {}        # msg_id -> latest frame (bytes)
         self._pending_results = {}        # command_id -> response dict
         self._pending_cv = threading.Condition()
+        self._crash_timers = {}           # pc_name -> pending crash Timer
+        self._timer_lock = threading.Lock()
+        self._udp_sock = None             # UDP LAN discovery responder
 
     # ---------------------------------------------------------- lifecycle
     def start(self):
@@ -160,8 +276,12 @@ class LabServer:
         t2.start()
         self.threads.append(t2)
 
+        # UDP LAN discovery responder (broadcast probes -> our address)
+        self._start_discovery()
+
         self._emit("server_started", {"host": self._lan_ip(), "port": self.port})
-        print(f"[SERVER] Listening on {self.host}:{self.port} (TLS)")
+        print(f"[SERVER] Listening on {self.host}:{self.port} (TLS) "
+              f"+ UDP discovery {discovery_udp_port(self.port)}")
 
     def stop(self):
         self.running = False
@@ -181,12 +301,79 @@ class LabServer:
             self.clients.clear()
         for ev in list(self.screen_watchers.values()):
             ev.set()
+        # Task 5: nothing survives a server shutdown - end every remote
+        # control session (audited) rather than leaving one dangling.
+        for name in list(getattr(self, "remote_sessions", {}) or {}):
+            try:
+                self.end_remote_control_on_drop(name)
+            except Exception:
+                traceback.print_exc()
+        # Never escalate a disconnect to a crash after shutdown (P3).
+        with self._timer_lock:
+            for t in self._crash_timers.values():
+                t.cancel()
+            self._crash_timers.clear()
         try:
             if self.listener:
                 self.listener.close()
         except Exception:
             pass
+        try:
+            if self._udp_sock:
+                self._udp_sock.close()
+                self._udp_sock = None
+        except Exception:
+            pass
         self._emit("server_stopped", {})
+
+    def _start_discovery(self):
+        """UDP LAN discovery responder: answer broadcast probes with this
+        server's address so Client PCs can find it without a configured
+        (or still valid) server_ip - spec: broadcast on TCP port + 1 = 8444.
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", discovery_udp_port(self.port)))
+            sock.settimeout(0.5)
+            self._udp_sock = sock
+        except OSError as e:
+            print(f"[SERVER] UDP discovery disabled: {e}")
+            return
+
+        def _responder():
+            while self.running:
+                try:
+                    data, addr = sock.recvfrom(1024)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    # Windows surfaces stray ICMP "port unreachable"
+                    # errors here whenever a probe socket closed while
+                    # one of our replies was still in flight - keep
+                    # serving; only a real shutdown ends the loop.
+                    if not self.running or sock.fileno() < 0:
+                        break
+                    time.sleep(0.05)   # never busy-spin on stray errors
+                    continue
+                try:
+                    probe = json.loads(data.decode("utf-8", "replace"))
+                    if (not isinstance(probe, dict)
+                            or probe.get("type") != DISCOVER_MAGIC):
+                        continue
+                    reply = {"type": REPLY_MAGIC,
+                             "server_ip": (self._lan_ip()
+                                           if self.host in ("0.0.0.0", "", "::")
+                                           else self.host),
+                             "tcp_port": self.port}
+                    sock.sendto(json.dumps(reply).encode("utf-8"), addr)
+                except Exception:
+                    continue        # malformed probes / stray resets ignored
+
+        t = threading.Thread(target=_responder, daemon=True,
+                             name="udp-discovery")
+        t.start()
+        self.threads.append(t)
 
     def _lan_ip(self) -> str:
         try:
@@ -203,6 +390,31 @@ class LabServer:
             self.on_event(kind, data)
         except Exception:
             pass
+
+    def _emit_state(self, entry):
+        """Push a status_changed event whenever the derived state differs
+        from the last one emitted - the dashboard refreshes on these and
+        never guesses a status of its own."""
+        if entry is None:
+            return
+        try:
+            state = derive_status(entry)
+        except Exception:
+            state = "unknown"
+        prev = getattr(entry, "_last_state", "")
+        if state == prev:
+            return
+        entry._last_state = state
+        self._emit("status_changed", {
+            "pc_name": entry.pc_name or entry.ip or "?",
+            "state": state,
+            "previous": prev,
+            "is_online": bool(getattr(entry, "is_online", False)),
+            "account_role": (getattr(entry, "account_role", None)
+                             or getattr(entry, "auth_role", None) or ""),
+            "account_full_name": (getattr(entry, "account_full_name", None)
+                                  or getattr(entry, "auth_full_name", None) or ""),
+        })
 
     # ---------------------------------------------------------- networking
     def _accept_loop(self):
@@ -233,10 +445,18 @@ class LabServer:
         print(f"[SERVER] Connection from {addr}")
         try:
             while self.running:
+                t0 = time.time()
                 msg = entry.wrapper.recv_message(timeout=1.0)
                 if msg is None:
-                    # recv_message returns None on timeout OR disconnect;
-                    # check whether the socket is actually still alive.
+                    # recv_message returns None on timeout OR disconnect.
+                    # A genuine timeout waits the full second, so a fast
+                    # None means EOF/reset - the client is gone (a
+                    # getpeername check cannot see a half-closed socket
+                    # and would spin here forever).  Exit so the finally
+                    # block unregisters the PC, closes its sessions and
+                    # records the Network Disconnect (P3 taxonomy).
+                    if time.time() - t0 < 0.5:
+                        break
                     try:
                         entry.wrapper.sock.getpeername()
                     except Exception:
@@ -248,6 +468,7 @@ class LabServer:
         finally:
             print(f"[SERVER] Disconnected {addr} pc={entry.pc_name}")
             self._unregister(entry)
+            self._on_connection_lost(entry)
             entry.close()
 
     def server_ssl_ctx_wrap(self, sock):
@@ -261,6 +482,7 @@ class LabServer:
         while self.running:
             time.sleep(5)
             now = time.time()
+            dropped = []
             with self.clients_lock:
                 for name, entry in list(self.clients.items()):
                     if now - entry.last_heartbeat > 15:
@@ -268,12 +490,25 @@ class LabServer:
                             entry.is_online = False
                             self._persist_computer(entry, online=0)
                             self._emit("client_offline", {"pc_name": name})
+                            self._emit_state(entry)
+                        # Task 5: a PC that stopped heartbeating can no
+                        # longer be controlled safely - flag its remote
+                        # session for an immediate, audited end.  Collected
+                        # here and processed BELOW so we never take
+                        # clients_lock twice on the same thread.
+                        if name in self.remote_sessions:
+                            dropped.append(name)
                         # Stop screen streaming
                         if entry.screen_streaming:
                             entry.screen_streaming = False
                             ev = self.screen_watchers.pop(name, None)
                             if ev:
                                 ev.set()
+            for name in dropped:
+                try:
+                    self.end_remote_control_on_drop(name)
+                except Exception:
+                    traceback.print_exc()
 
     # ---------------------------------------------------------- dispatch
     def _handle_message(self, entry: ClientEntry, msg: Message):
@@ -286,6 +521,8 @@ class LabServer:
             self._on_heartbeat(entry, p)
         elif t == MessageType.AUTH_REQUEST.value:
             self._on_auth(entry, msg, p)
+        elif t == MessageType.PASSWORD_CHANGE_REQUEST.value:
+            self._on_password_change(entry, p)
         elif t == MessageType.SESSION_START.value:
             self._on_session_start(entry, p)
         elif t == MessageType.SESSION_END.value:
@@ -296,6 +533,10 @@ class LabServer:
             self._on_stu_request(entry, msg, p)
         elif t == MessageType.CMD_RESPONSE.value:
             self._on_cmd_response(p)
+        elif t == MessageType.WEB_POLICY_ACK.value:
+            # Website Access (spec 8): the client confirms which policy
+            # version it actually applied (or why it could not).
+            self._on_web_policy_ack(entry, p)
         elif t == MessageType.CMD_SCREENSHOT.value:
             self._on_screenshot(entry, msg, p)
         elif t == MessageType.CMD_SCREEN_OBSERVE_START.value:
@@ -313,6 +554,17 @@ class LabServer:
         entry.is_online = True
         entry.last_heartbeat = time.time()
 
+        # Reconnect taxonomy (P3): a returning client cancels its pending
+        # crash escalation, and the earlier drop is reclassified as a
+        # Network Disconnect + Reconnect pair instead of a crash.
+        with self._timer_lock:
+            pending = self._crash_timers.pop(entry.pc_name, None)
+        if pending:
+            pending.cancel()
+            self._log_activity("system", "client_reconnect", entry.pc_name,
+                               "Client reconnected after a network disconnect",
+                               entry.ip)
+
         with self.clients_lock:
             # Replace stale entry for same pc_name (handles server/client
             # restarts and duplicate registrations cleanly).
@@ -324,6 +576,7 @@ class LabServer:
         self._persist_computer(entry, online=1)
         entry.desired = self._load_desired(entry.pc_name)
         self._emit("client_online", entry.snapshot())
+        self._emit_state(entry)           # VERIFYING until the first heartbeat
 
         # Re-apply an outstanding admin lock/pause after (re)connection so a
         # restarted or reconnected client returns to the state the admin set.
@@ -345,6 +598,7 @@ class LabServer:
         entry.last_heartbeat = time.time()
         was_offline = not entry.is_online
         entry.is_online = True
+        entry.verifying = False           # first heartbeat proves the link
 
         if was_offline:
             with self.clients_lock:
@@ -358,11 +612,13 @@ class LabServer:
             "UPDATE computers SET cpu_percent=?, ram_percent=?, last_heartbeat=?, "
             "ip_address=COALESCE(NULLIF(?,''), ip_address), "
             "hostname=COALESCE(NULLIF(?,''), hostname), "
+            "connection_type=COALESCE(NULLIF(?,''), connection_type), "
             "status=CASE WHEN status IN ('Available','In Use') "
             "  THEN CASE WHEN ?='logged_in' THEN 'In Use' ELSE 'Available' END ELSE status END "
             "WHERE pc_name=?",
             (entry.cpu_percent, entry.ram_percent, now_datetime(),
-             entry.ip, entry.hostname, entry.status, entry.pc_name),
+             entry.ip, entry.hostname, p.get("conn_type") or "",
+             entry.status, entry.pc_name),
         )
         conn.commit()
         conn.close()
@@ -378,6 +634,7 @@ class LabServer:
             self._resync(entry)
 
         self._emit("client_heartbeat", entry.snapshot())
+        self._emit_state(entry)
 
     # -------------------------------------------- desired admin state sync
     def _load_desired(self, pc_name):
@@ -400,6 +657,11 @@ class LabServer:
             entry = self.clients.get(pc_name)
             if entry:
                 entry.desired = desired or None
+                # Resume reconciles a client-reported pause immediately so
+                # the grid never lags behind an explicit Resume.
+                if not desired and entry.status == "paused":
+                    entry.status = "logged_in" if entry.logged_in_user else "locked"
+                self._emit_state(entry)
 
     def _persist_admin_state(self, pc_name, state_json):
         try:
@@ -474,6 +736,13 @@ class LabServer:
             return
         conn = get_connection()
         conn.execute("UPDATE computers SET is_online=0 WHERE pc_name=?", (entry.pc_name,))
+        # Website Access: an unreachable PC can no longer hold a synced
+        # policy - its row goes OFFLINE until the client reconnects and
+        # re-acks (spec item 8 status list).
+        conn.execute(
+            "UPDATE web_pc_policy SET sync_status='OFFLINE', updated_at=? "
+            "WHERE pc_name=?",
+            (now_datetime(), entry.pc_name))
         # Close every session still open on this PC: the connection that
         # owned them is gone. Matched by pc_name (not entry.session_id)
         # because heartbeats continuously overwrite that field - a logged-out
@@ -486,18 +755,86 @@ class LabServer:
         entry.session_id = None
         conn.commit()
         conn.close()
+        # Task 5: a dropped connection can never leave a live remote-control
+        # session behind.  The session table is cleared BEFORE any
+        # reconnect can be noticed, so a returning Client always starts
+        # from a clean state and can never be reconnected back into an
+        # active session.  The end-of-session audit row is written here
+        # too - the Client is gone, so no ack can ever arrive for it.
+        try:
+            self.end_remote_control_on_drop(entry.pc_name)
+        except Exception:
+            traceback.print_exc()
         if entry.is_online:
             entry.is_online = False
             self._emit("client_offline", {"pc_name": entry.pc_name})
+            self._emit_state(entry)
+
+    # ------------------------------------------------- disconnect taxonomy
+    def _on_connection_lost(self, entry):
+        """A dropped connection is a NETWORK DISCONNECT, not a logout.
+
+        The client may be rebooting or merely re-establishing the link, so
+        the event is recorded immediately and only escalated to a CLIENT
+        CRASH if the PC never reconnects within the grace period.  Normal
+        Logout (client_logout/session_end) and Client Closed arrive as
+        explicit messages instead, so all four events stay distinct (P3).
+        Skipped while the server is stopping - there the drop is ours.
+        """
+        name = entry.pc_name
+        if not name or not self.running:
+            return
+        self._log_activity(
+            "system", "network_disconnect", name,
+            f"Connection lost from {entry.ip} "
+            f"(user {entry.auth_user or entry.logged_in_user or '-'})",
+            entry.ip)
+        timer = threading.Timer(CRASH_GRACE_SECONDS,
+                                self._escalate_disconnect, args=(name,))
+        timer.daemon = True
+        with self._timer_lock:
+            old = self._crash_timers.pop(name, None)
+            if old:
+                old.cancel()
+            self._crash_timers[name] = timer
+        timer.start()
+
+    def _escalate_disconnect(self, name):
+        """Grace expired without a reconnect: the drop was a client crash
+        (process died or PC shut down - it can no longer say otherwise)."""
+        with self._timer_lock:
+            self._crash_timers.pop(name, None)
+        if not self.running:
+            return
+        with self.clients_lock:
+            if name in self.clients:      # reconnected in time - not a crash
+                return
+        self._log_activity(
+            "system", "client_crash", name,
+            f"No reconnect {CRASH_GRACE_SECONDS}s after a network disconnect "
+            "(presumed client crash or PC shutdown)")
+        self._emit("client_crash", {"pc_name": name})
 
     # ------------------------------------------------------------- auth
     def _on_auth(self, entry: ClientEntry, msg: Message, p: dict):
+        # Authenticating counts as VERIFYING until the exchange finishes.
+        entry.verifying = True
+        self._emit_state(entry)
+        try:
+            return self._do_auth(entry, p)
+        finally:
+            entry.verifying = False
+            self._emit_state(entry)
+
+    def _do_auth(self, entry: ClientEntry, p: dict):
         from protocol import build_auth_response
         username = (p.get("username") or "").strip()
         password = p.get("password") or ""
-        role = p.get("role") or "student"
         client_info = p.get("client_info") or {}
 
+        # NOTE: the client can send any role string it likes - it is
+        # deliberately ignored here.  The role always comes from the
+        # central DB row, so a client can never self-claim admin.
         conn = get_connection()
         row = conn.execute("SELECT * FROM users WHERE student_id=?", (username,)).fetchone()
         conn.close()
@@ -514,14 +851,29 @@ class LabServer:
             entry.send(build_auth_response(False, error="Account deactivated"))
             return
 
-        # Role check: students can log into clients; admin/staff too
-        if row["role"] not in ("student", "admin", "staff"):
+        # Role check: students can log into clients; admin/staff and the
+        # maintenance technician do too
+        if row["role"] not in ("student", "admin", "staff", "maintenance"):
             entry.send(build_auth_response(False, error="Role not permitted"))
             return
+
+        # FIRST LOGIN PASSWORD: fresh client (student) accounts are
+        # flagged when created, and the factory default password itself
+        # always counts as still-default (covers accounts created before
+        # the flag existed).  Admin/staff/maintenance accounts are never
+        # forced.
+        must_change = False
+        if row["role"] == "student":
+            flagged = (bool(row["must_change_password"])
+                       if "must_change_password" in row.keys() else False)
+            must_change = flagged or password == DEFAULT_CLIENT_PASSWORD
+        entry.must_change_password = must_change
 
         token = uuid.uuid4().hex
         entry.authenticated = True
         entry.auth_role = row["role"]
+        entry.auth_user = row["student_id"]        # server-validated identity
+        entry.auth_full_name = row["full_name"]
 
         # Record client info (no hardware specs are collected)
         if client_info and client_info.get("hostname"):
@@ -529,6 +881,13 @@ class LabServer:
 
         self._log_activity(username, "login_success", entry.pc_name or entry.ip,
                            f"{row['full_name']} logged in ({row['role']})", entry.ip)
+        # Client-admin logins get their own audit rows (and so do their
+        # session ends - see _on_session_end).
+        if row["role"] == "admin":
+            self._log_activity(username, "client_admin_login",
+                               entry.pc_name or entry.ip,
+                               f"{row['full_name']} logged in on a client PC",
+                               entry.ip)
 
         user_data = {
             "id": row["id"],
@@ -537,15 +896,84 @@ class LabServer:
             "role": row["role"],
             "course": row["course"],
             "year_level": row["year_level"],
+            "must_change_password": must_change,
         }
         entry.send(build_auth_response(True, user_data=user_data, token=token))
         self._emit("auth_success", {"pc": entry.pc_name, "user": username, "role": row["role"]})
 
+    def _on_password_change(self, entry, p):
+        """FIRST LOGIN PASSWORD: a fresh client account replaces its
+        default password.  The identity comes from the authenticated
+        TLS entry (entry.auth_user), never from the payload - a client
+        can only change its OWN password, only while authenticated."""
+        from protocol import build_password_change_response
+        user = entry.auth_user if getattr(entry, "authenticated", False) else None
+        if not user:
+            entry.send(build_password_change_response(
+                False, error="Not authenticated. Please log in again."))
+            return
+        new_pw = p.get("new_password") or ""
+        if len(new_pw) < 6:
+            entry.send(build_password_change_response(
+                False, error="Password must be at least 6 characters."))
+            return
+        if new_pw == DEFAULT_CLIENT_PASSWORD:
+            entry.send(build_password_change_response(
+                False,
+                error="The new password cannot be the default password."))
+            return
+        conn = get_connection()
+        row = conn.execute("SELECT password FROM users WHERE student_id=?",
+                           (user,)).fetchone()
+        if not row:
+            conn.close()
+            entry.send(build_password_change_response(
+                False, error="Account not found."))
+            return
+        if verify_password(new_pw, row["password"]):
+            conn.close()
+            entry.send(build_password_change_response(
+                False,
+                error="Choose a password different from your current one."))
+            return
+        # PBKDF2 hash only - a plaintext password is never stored, nor
+        # is the submitted password ever logged.
+        conn.execute(
+            "UPDATE users SET password=?, must_change_password=0 "
+            "WHERE student_id=?",
+            (hash_password(new_pw), user))
+        conn.commit()
+        conn.close()
+        entry.must_change_password = False
+        self._log_activity(user, "password_changed",
+                           entry.pc_name or entry.ip,
+                           "Default password replaced with a new password",
+                           entry.ip)
+        entry.send(build_password_change_response(True))
+
     # ----------------------------------------------------------- sessions
     def _on_session_start(self, entry, p):
+        # FIRST LOGIN PASSWORD: no session may start while the default
+        # password is still in place.  The kiosk already blocks its own
+        # UI until the server confirms the change - this is the
+        # server-side guarantee that normal usage is impossible.
+        if getattr(entry, "must_change_password", False):
+            self._log_activity(entry.auth_user or "?", "session_start_blocked",
+                               entry.pc_name or entry.ip,
+                               "Session refused: default password not changed yet",
+                               entry.ip)
+            return
         sid = p.get("session_id") or uuid.uuid4().hex[:12]
         pc = p.get("pc_name", entry.pc_name)
-        user = p.get("student_id", "")
+        # Server-authoritative identity: after a successful AUTH the session
+        # ALWAYS belongs to the authenticated account - the client cannot
+        # claim another user's ID or name in this message.
+        if getattr(entry, "authenticated", False) and entry.auth_user:
+            user = entry.auth_user
+            full_name = entry.auth_full_name or p.get("full_name", "")
+        else:
+            user = p.get("student_id", "")
+            full_name = p.get("full_name", "")
         conn = get_connection()
         # Self-heal: close any session left open for this PC or this user
         # (crash, power loss, unclean shutdown) so no ghost "Active" rows
@@ -562,14 +990,25 @@ class LabServer:
                 "WHERE logout_time IS NULL AND pc_name=?",
                 (now_datetime(), pc),
             )
+        # the PC's reported network medium (heartbeat) as of session start
+        medium = ""
+        try:
+            mrow = conn.execute(
+                "SELECT connection_type FROM computers WHERE pc_name=?",
+                (pc,)).fetchone()
+            if mrow:
+                medium = mrow["connection_type"] or ""
+        except Exception:
+            medium = ""
         conn.execute(
             "INSERT OR REPLACE INTO client_sessions "
-            "(session_id, pc_name, student_id, full_name, login_time, ip_address, status) "
-            "VALUES (?,?,?,?,?,?, 'Active')",
-            (sid, pc, user,
-             p.get("full_name", ""), datetime.fromtimestamp(p.get("start_time", time.time()))
+            "(session_id, pc_name, student_id, full_name, login_time, "
+            " ip_address, status, connection_type) "
+            "VALUES (?,?,?,?,?,?, 'Active', ?)",
+            (sid, pc, user, full_name,
+             datetime.fromtimestamp(p.get("start_time", time.time()))
                  .strftime("%Y-%m-%d %H:%M:%S"),
-             entry.ip),
+             entry.ip, medium),
         )
         # NOTE: the Lab Attendance feature was intentionally removed - only
         # the PC session record is kept (Internet Cafe PC management focus).
@@ -577,12 +1016,27 @@ class LabServer:
             "UPDATE computers SET status='In Use', assigned_to=? WHERE pc_name=?",
             (user, pc),
         )
+        # Account role/name for the CURRENT SESSION come from the central DB
+        # row (never from the client payload).
+        arow = None
+        if user:
+            arow = conn.execute(
+                "SELECT role, full_name FROM users WHERE student_id=?",
+                (user,)).fetchone()
         conn.commit()
         conn.close()
         entry.session_id = sid
         entry.status = "logged_in"
-        entry.logged_in_user = p.get("student_id")
-        self._emit("session_started", p)
+        entry.logged_in_user = user
+        if arow:
+            entry.account_role = arow["role"]
+            entry.account_full_name = arow["full_name"]
+        else:
+            entry.account_role = entry.auth_role or ""
+            entry.account_full_name = entry.auth_full_name or full_name
+        self._emit("session_started",
+                   dict(p, student_id=user, full_name=full_name))
+        self._emit_state(entry)
 
     def _on_session_end(self, entry, p):
         sid = p.get("session_id") or entry.session_id
@@ -615,10 +1069,19 @@ class LabServer:
         conn.commit()
         conn.close()
         if entry.session_id == sid:
+            # A client-admin session ending gets its own audit row.
+            if (entry.account_role or entry.auth_role) == "admin":
+                self._log_activity(entry.auth_user or entry.logged_in_user or "?",
+                                   "client_admin_logout",
+                                   entry.pc_name or entry.ip,
+                                   "Client-admin session ended", entry.ip)
             entry.session_id = None
             entry.status = "locked"
             entry.logged_in_user = None
+            entry.account_role = None
+            entry.account_full_name = None
         self._emit("session_ended", {"session_id": sid, "duration": duration})
+        self._emit_state(entry)
 
     # ------------------------------------------------ student-facing queries
     def _on_stu_request(self, entry, msg: Message, p: dict):
@@ -694,6 +1157,67 @@ class LabServer:
                 rows = conn.execute("SELECT * FROM computers ORDER BY pc_name").fetchall()
                 data = [dict(r) for r in rows]
 
+            elif kind == "web_filter":
+                # Website Access: the full policy snapshot a client pulls
+                # on every (re)connect (version + mode + rule lists);
+                # client.apply_web_policy applies it and acks the version.
+                data = self.get_web_policy(
+                    getattr(entry, "pc_name", "") or None)
+
+            elif kind == "auth_roster":
+                # Offline login (spec items 10/12): the client caches this
+                # roster over TLS and verifies offline logins against the
+                # salted hashes - never plaintext.  max_offline_days caps
+                # how long a roster may be used without a refresh.
+                rows = conn.execute(
+                    "SELECT student_id, full_name, role, password, status,"
+                    " must_change_password FROM users WHERE status='Active'"
+                    " ORDER BY student_id").fetchall()
+                data = {"users": [
+                    {"student_id": r["student_id"],
+                     "full_name": r["full_name"],
+                     "role": r["role"],
+                     "password_hash": r["password"],
+                     "status": r["status"],
+                     "must_change_password":
+                         1 if r["must_change_password"] else 0}
+                    for r in rows],
+                    "max_offline_days": get_setting("max_offline_days", "7")}
+
+            elif kind == "log_sync":
+                # Local event log flush (spec items 9/11/15/17): event_id
+                # is the client's UUID and the PRIMARY KEY of client_logs,
+                # so INSERT OR IGNORE dedupes a resent batch and every
+                # submitted id comes back as accepted - the client marks
+                # exactly those rows SYNCED (idempotent, never lost).
+                events = d.get("events") or []
+                stored = 0
+                accepted = []
+                now = now_datetime()
+                pc = str(d.get("pc_name") or getattr(entry, "pc_name", "")
+                         or "")
+                for ev in events[:200]:
+                    eid = str(ev.get("event_id") or "").strip()
+                    if not eid:
+                        continue
+                    accepted.append(eid)
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO client_logs"
+                        " (event_id, pc_name, user_id, severity, category,"
+                        "  message, detail, created_at, received_at)"
+                        " VALUES (?,?,?,?,?,?,?,?,?)",
+                        (eid, str(ev.get("pc_name") or pc),
+                         str(ev.get("user_id") or ""),
+                         str(ev.get("severity") or "INFO"),
+                         str(ev.get("category") or ""),
+                         str(ev.get("message") or ""),
+                         str(ev.get("detail") or ""),
+                         str(ev.get("created_at") or ""), now))
+                    stored += cur.rowcount or 0
+                conn.commit()
+                data = {"accepted": accepted, "stored": stored,
+                        "duplicates": len(accepted) - stored}
+
             else:
                 ok, err = False, f"Unknown query kind: {kind}"
 
@@ -768,6 +1292,128 @@ class LabServer:
         with self.clients_lock:
             return [e.snapshot() for e in self.clients.values()]
 
+    def list_pc_states(self) -> list:
+        """Single source of truth for the dashboard PC grid: live entries
+        merged with every PC that has EVER connected (last_heartbeat set).
+
+        Never-connected rows (old demo seeds, manual inventory) are NOT
+        included - no fake "offline" PCs are pre-seeded.  Every item
+        carries the server-derived `state` plus session account info;
+        passwords are never part of any payload.
+        """
+        with self.clients_lock:
+            live = {n: e for n, e in self.clients.items() if n}
+        db_rows = {}
+        try:
+            conn = get_connection()
+            for r in conn.execute(
+                    "SELECT pc_name, ip_address, hostname, status, assigned_to, "
+                    "cpu_percent, ram_percent, last_heartbeat, is_online, location "
+                    "FROM computers WHERE last_heartbeat IS NOT NULL OR is_online=1"
+            ).fetchall():
+                db_rows[r["pc_name"]] = r
+            conn.close()
+        except Exception:
+            traceback.print_exc()
+
+        out, seen = [], set()
+        for name in sorted(live):
+            seen.add(name)
+            snap = live[name].snapshot()
+            row = db_rows.get(name)
+            if row is not None:
+                snap["location"] = row["location"] or ""
+            out.append(snap)
+        # Offline PCs: known to the server (ever connected) but no live entry
+        for name, row in db_rows.items():
+            if name in seen:
+                continue
+            out.append({
+                "pc_name": name,
+                "ip": row["ip_address"] or "",
+                "hostname": row["hostname"] or "",
+                "status": row["status"] or "",
+                "state": derive_status(None, row),
+                "account_role": "",
+                "account_full_name": "",
+                "cpu_percent": row["cpu_percent"] or 0,
+                "ram_percent": row["ram_percent"] or 0,
+                "logged_in_user": row["assigned_to"] or "",
+                "session_id": "",
+                "is_online": False,
+                "last_heartbeat": row["last_heartbeat"] or "",
+                "verifying": False,
+                "admin_cmd": "",
+                "location": row["location"] or "",
+            })
+        out.sort(key=lambda s: str(s.get("pc_name") or ""))
+        return out
+
+    # ------------------------------------------------------------- bulk ops
+    BULK_ACTIONS = {
+        "pause": MessageType.CMD_PAUSE,
+        "resume": MessageType.CMD_RESUME,
+        "logout": MessageType.CMD_LOGOUT,
+        "lock": MessageType.CMD_LOCK,
+        "unlock": MessageType.CMD_UNLOCK,          # Unlock / Force Login
+        "force_unlock": MessageType.CMD_UNLOCK,
+        "restart": MessageType.CMD_RESTART,
+        "shutdown": MessageType.CMD_SHUTDOWN,
+    }
+
+    def bulk_command(self, action, pc_names, admin_user="", params=None,
+                     timeout=None) -> dict:
+        """Run one action across many PCs with an honest per-PC result:
+
+            SUCCESS  - the client ACKed the command
+            FAILED   - send failed or the client rejected it
+            OFFLINE  - no live connection (never sent)
+            TIMEOUT  - no ACK within the timeout
+
+        Writes one BULK_<ACTION> audit row per targeted PC.
+        """
+        action = (action or "").lower().strip()
+        cmd = self.BULK_ACTIONS.get(action)
+        results = {}
+        if not cmd:
+            return {str(pc): {"success": False, "result": "FAILED",
+                              "error": f"unknown action '{action}'"}
+                    for pc in (pc_names or [])}
+        for pc in [str(x) for x in (pc_names or [])]:
+            entry = self.get_client(pc)
+            if not entry or not entry.is_online:
+                results[pc] = {"success": False, "result": "OFFLINE",
+                               "error": f"{pc} is offline"}
+            else:
+                try:
+                    resp = self.send_command(cmd, pc, dict(params or {}),
+                                             admin_user=admin_user,
+                                             wait_response=True, timeout=timeout)
+                except Exception as e:
+                    resp = {"success": False, "error": str(e)}
+                if resp.get("success"):
+                    results[pc] = {"success": True, "result": "SUCCESS",
+                                   "command_id": resp.get("command_id", "")}
+                else:
+                    err = str(resp.get("error") or "")
+                    low = err.lower()
+                    if "timeout" in low:
+                        kind = "TIMEOUT"
+                    elif "offline" in low:
+                        kind = "OFFLINE"
+                    else:
+                        kind = "FAILED"
+                    results[pc] = {"success": False, "result": kind,
+                                   "error": err,
+                                   "command_id": resp.get("command_id", "")}
+            r = results[pc]
+            self._log_activity(admin_user or "system", f"BULK_{action.upper()}",
+                               pc, f"result={r['result']}"
+                               + (f" {r.get('error')}" if r.get("error") else ""))
+        self._emit("bulk_done", {"action": action, "count": len(results),
+                                 "results": results})
+        return results
+
     def get_client(self, pc_name):
         with self.clients_lock:
             return self.clients.get(pc_name)
@@ -821,6 +1467,258 @@ class LabServer:
                 self._pending_cv.wait(min(0.5, max(0.05, deadline - time.time())))
         return {"success": False, "error": "Timeout waiting for response",
                 "command_id": command_id}
+
+    # Website Access -------------------------------------------------------
+    WEB_MODES = ("allow_all", "block_list", "allow_only")
+
+    @staticmethod
+    def _web_mode_default(conn) -> str:
+        row = conn.execute(
+            "SELECT value FROM system_settings WHERE key='web_mode'").fetchone()
+        mode = (row["value"] if row else "") or "allow_all"
+        return mode if mode in LabServer.WEB_MODES else "allow_all"
+
+    def get_web_filter(self) -> list:
+        """Back-compat view: the enabled block-list domains only."""
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT domain FROM websites WHERE list_type='blocked' "
+                "AND enabled=1 ORDER BY domain").fetchall()
+            return [r["domain"] for r in rows]
+        finally:
+            conn.close()
+
+    def get_web_policy(self, pc_name: str = None) -> dict:
+        """Full Website Access policy snapshot (spec items 6-8).
+
+        {version, mode, blocked, allowed, upstream_dns} - mode is the
+        per-PC override when pc_name has one, else the global default.
+        Lists contain enabled rules only."""
+        conn = get_connection()
+        try:
+            def setting(key, default):
+                row = conn.execute(
+                    "SELECT value FROM system_settings WHERE key=?",
+                    (key,)).fetchone()
+                return row["value"] if row and row["value"] not in (None, "") \
+                    else default
+            try:
+                version = int(setting("web_policy_version", "0"))
+            except (TypeError, ValueError):
+                version = 0
+            blocked = [r["domain"] for r in conn.execute(
+                "SELECT domain FROM websites WHERE list_type='blocked' "
+                "AND enabled=1 ORDER BY domain").fetchall()]
+            allowed = [r["domain"] for r in conn.execute(
+                "SELECT domain FROM websites WHERE list_type='allowed' "
+                "AND enabled=1 ORDER BY domain").fetchall()]
+            mode = None
+            if pc_name:
+                row = conn.execute(
+                    "SELECT mode FROM web_pc_policy WHERE pc_name=?",
+                    (pc_name,)).fetchone()
+                if row and row["mode"] in self.WEB_MODES:
+                    mode = row["mode"]
+            if not mode:
+                mode = self._web_mode_default(conn)
+            return {"version": version, "mode": mode, "blocked": blocked,
+                    "allowed": allowed,
+                    "upstream_dns": setting("upstream_dns", "1.1.1.1")}
+        finally:
+            conn.close()
+
+    def bump_web_policy_version(self) -> int:
+        """Create a new policy version (spec item 8: every rules/mode
+        change gets its own version number)."""
+        conn = get_connection()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO system_settings (key, value, description) "
+                "VALUES ('web_policy_version','0',"
+                "'Monotonic Website Access policy version')")
+            conn.execute(
+                "UPDATE system_settings SET value = CAST(value AS INTEGER) + 1 "
+                "WHERE key='web_policy_version'")
+            conn.commit()
+            row = conn.execute(
+                "SELECT value FROM system_settings "
+                "WHERE key='web_policy_version'").fetchone()
+            return int(row["value"])
+        finally:
+            conn.close()
+
+    def set_web_mode(self, mode, pc_names=None, admin_user="") -> dict:
+        """Spec item 7: apply a Website Access mode to a scope of PCs.
+
+        pc_names=None targets every registered PC (and re-saves the
+        global default); a list targets exactly those PCs.  Bumps the
+        policy version, records the desired mode per PC, then pushes."""
+        if mode not in self.WEB_MODES:
+            return {"success": False,
+                    "error": f"Unknown mode: {mode!r} "
+                             f"(expected one of {', '.join(self.WEB_MODES)})"}
+        version = self.bump_web_policy_version()
+        conn = get_connection()
+        try:
+            if pc_names is None:
+                pc_names = [r["pc_name"] for r in conn.execute(
+                    "SELECT pc_name FROM computers ORDER BY pc_name").fetchall()]
+                # applying to every PC also re-saves the global default
+                # so future/re-registered PCs inherit it (upsert: the old
+                # REPLACE form dropped the description the settings page
+                # shows as the field label)
+                conn.execute(
+                    "INSERT INTO system_settings (key, value) "
+                    "VALUES ('web_mode', ?) ON CONFLICT(key) DO UPDATE "
+                    "SET value = excluded.value", (mode,))
+            for name in pc_names:
+                if not name:
+                    continue
+                conn.execute(
+                    "INSERT INTO web_pc_policy "
+                    "(pc_name, mode, version, sync_status, enforced, "
+                    " last_error, updated_at) "
+                    "VALUES (?,?,?, 'OFFLINE', '', '', ?) "
+                    "ON CONFLICT(pc_name) DO UPDATE SET "
+                    "  mode=excluded.mode, version=excluded.version, "
+                    "  updated_at=excluded.updated_at",
+                    (name, mode, version, now_datetime()))
+            conn.commit()
+        finally:
+            conn.close()
+        pushed = self.push_web_filter(admin_user=admin_user,
+                                      pc_names=pc_names, version=version)
+        return {"success": True, "version": version,
+                "targets": len(pc_names), "sent": pushed.get("sent", 0),
+                "offline": pushed.get("offline", 0)}
+
+    def push_web_filter(self, admin_user: str = "", pc_names=None,
+                        version=None) -> dict:
+        """Send the current policy snapshot to Client PCs (spec 6-8).
+
+        Each target row in web_pc_policy records the desired mode and
+        version with status SYNCING (online) or OFFLINE (offline).  A row
+        only becomes SYNCED when the client's WEB_POLICY_ACK for exactly
+        that version arrives - never before (spec item 8)."""
+        conn = get_connection()
+        try:
+            if version is None:
+                try:
+                    row = conn.execute(
+                        "SELECT value FROM system_settings "
+                        "WHERE key='web_policy_version'").fetchone()
+                    version = int(row["value"])
+                except (TypeError, ValueError, AttributeError):
+                    version = 0
+            if pc_names is None:
+                # every known PC: registered rows plus currently online
+                # clients (an online client not yet in computers still
+                # gets its policy)
+                pc_names = {r["pc_name"] for r in conn.execute(
+                    "SELECT pc_name FROM computers").fetchall()}
+                with self.clients_lock:
+                    pc_names |= {n for n, e in self.clients.items() if n}
+                pc_names = sorted(pc_names)
+            sent = offline = 0
+            for name in pc_names:
+                if not name:
+                    continue
+                # keep an existing per-PC mode override, else the default
+                row = conn.execute(
+                    "SELECT mode FROM web_pc_policy WHERE pc_name=?",
+                    (name,)).fetchone()
+                mode = row["mode"] if row and row["mode"] in self.WEB_MODES \
+                    else self._web_mode_default(conn)
+                online = False
+                with self.clients_lock:
+                    e = self.clients.get(name)
+                    online = bool(e and e.is_online)
+                status = "SYNCING" if online else "OFFLINE"
+                conn.execute(
+                    "INSERT INTO web_pc_policy "
+                    "(pc_name, mode, version, sync_status, enforced, "
+                    " last_error, updated_at) "
+                    "VALUES (?,?,?,?,'','',?) "
+                    "ON CONFLICT(pc_name) DO UPDATE SET "
+                    "  mode=excluded.mode, version=excluded.version, "
+                    "  sync_status=excluded.sync_status, "
+                    "  updated_at=excluded.updated_at",
+                    (name, mode, version, status, now_datetime()))
+                conn.commit()
+                if not online:
+                    offline += 1
+                    continue
+                policy = {"version": version, "mode": mode,
+                          "blocked": [], "allowed": []}
+                pol = self.get_web_policy(name)
+                policy.update({"blocked": pol["blocked"],
+                               "allowed": pol["allowed"],
+                               "upstream_dns": pol["upstream_dns"],
+                               "version": version})
+                res = self.send_command(
+                    MessageType.CMD_WEB_FILTER, name, {"policy": policy},
+                    admin_user, wait_response=False)
+                if res.get("success"):
+                    sent += 1
+                else:
+                    # raced with a disconnect: no chance of an ack
+                    conn.execute(
+                        "UPDATE web_pc_policy SET sync_status='OFFLINE', "
+                        "updated_at=? WHERE pc_name=?",
+                        (now_datetime(), name))
+                    conn.commit()
+                    offline += 1
+            return {"sent": sent, "offline": offline,
+                    "targets": len(pc_names), "version": version}
+        finally:
+            conn.close()
+
+    def _on_web_policy_ack(self, entry, p: dict):
+        """Spec item 8: record the client's answer for a policy version."""
+        pc = (getattr(entry, "pc_name", "") or entry.ip or
+              p.get("pc_name") or "")
+        try:
+            version = int(p.get("version"))
+        except (TypeError, ValueError):
+            version = None          # unverifiable ack: never flips a row
+        success = bool(p.get("success"))
+        enforced = str(p.get("enforced") or "")
+        error = "" if success else str(p.get("error") or "apply failed")
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT version FROM web_pc_policy WHERE pc_name=?",
+                (pc,)).fetchone()
+            if row and (version is None
+                        or version != int(row["version"])):
+                # stale/unverifiable ack for another policy version - the
+                # newer push owns the row's status, ignore it
+                return
+            status = "SYNCED" if success else "FAILED"
+            now = now_datetime()
+            if row:
+                conn.execute(
+                    "UPDATE web_pc_policy SET sync_status=?, enforced=?, "
+                    "last_error=?, updated_at=? WHERE pc_name=?",
+                    (status, enforced, error, now, pc))
+            else:
+                # client pulled and applied on reconnect before we ever
+                # pushed to it - record its state now
+                conn.execute(
+                    "INSERT INTO web_pc_policy "
+                    "(pc_name, mode, version, sync_status, enforced, "
+                    " last_error, updated_at) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(pc_name) DO UPDATE SET "
+                    "  version=excluded.version, sync_status=excluded.sync_status, "
+                    "  enforced=excluded.enforced, last_error=excluded.last_error, "
+                    "  updated_at=excluded.updated_at",
+                    (pc, p.get("mode") or "allow_all",
+                     version if version is not None else 0, status,
+                     enforced, error, now))
+            conn.commit()
+        finally:
+            conn.close()
 
     # Convenience wrappers -------------------------------------------------
     def _audit_command(self, target_pc, cmd_type, params, admin_user,
@@ -919,6 +1817,18 @@ class LabServer:
                 "WHERE pc_name=? AND assigned_to=?", (r["pc_name"], student_id))
             conn.commit()
             conn.close()
+            # Clear the LIVE entry immediately as well: the dashboard must
+            # not keep showing a session that no longer exists.
+            with self.clients_lock:
+                e = self.clients.get(r["pc_name"])
+            if e and (e.session_id == r["session_id"]
+                      or e.logged_in_user == student_id):
+                e.session_id = None
+                e.logged_in_user = None
+                e.status = "locked"
+                e.account_role = None
+                e.account_full_name = None
+                self._emit_state(e)
             forced += 1
         if forced:
             self._log_activity(admin or "system", "force_logout", student_id,
@@ -954,9 +1864,56 @@ class LabServer:
         self._log_activity(admin, "screenshot", pc, "FAILED: timeout")
         return {"success": False, "error": "Screenshot timeout"}
 
+    # ------------------------------------------- P4: ADMINISTRATOR only
+    def _observe_role_ok(self, role, admin, action, pc, once_key=None):
+        """ADMINISTRATOR-only gate for Observe / Remote Control (P4).
+
+        Watching a screen or driving a machine is reserved for the
+        ADMINISTRATOR role, so every entry point - opening an Observe
+        stream, starting a Remote session and forwarding a single input
+        batch - passes through here and is refused AT THE SERVER, not
+        merely hidden by the UI.  The UI filter is a convenience; this is
+        the control.
+
+        A refusal is worth keeping: an attempt to take over a lab PC is a
+        security event, so it lands in the audit trail whether or not it
+        succeeded.  `once_key` keeps a hot path (one call per mouse move)
+        from drowning that trail - only the first refusal per key is
+        written.
+
+        Returns True when the role may proceed.  Never raises, and a
+        failure to write the audit row never turns a refusal into a
+        pass."""
+        try:
+            r = str(role or "").strip().lower()
+        except Exception:
+            r = ""
+        if r == "admin":
+            return True
+        if once_key is not None:
+            try:
+                with self._remote_lock:
+                    if once_key in self._remote_reject_seen:
+                        return False
+                    self._remote_reject_seen.add(once_key)
+                    if len(self._remote_reject_seen) > 256:
+                        self._remote_reject_seen.clear()
+            except Exception:
+                pass
+        try:
+            self._log_activity(admin or "-", action, pc,
+                               f"REJECTED: {r or 'no role'} is not an "
+                               f"administrator")
+        except Exception:
+            pass
+        return False
+
     def start_screen_observe(self, pc, admin="", interval=1.0,
-                             quality=50, scale=0.6) -> bool:
+                             quality=50, scale=0.6, role="") -> bool:
         from protocol import build_screen_observe_start
+        if not self._observe_role_ok(role, admin, "screen_observe_start",
+                                     pc):
+            return False
         entry = self.get_client(pc)
         if not entry or not entry.is_online:
             return False
@@ -967,10 +1924,17 @@ class LabServer:
         entry.screen_streaming = True
         msg = build_screen_observe_start(interval, quality, scale)
         msg.payload["target_pc"] = pc
+        # P1-8: hand the audit row's id to the client as its command_id, so
+        # the ack it already sends updates THIS row from Sent -> Done or
+        # Failed.  It used to be stamped "Done" on send, which claimed a
+        # confirmation the client had not given yet; if the link drops, the
+        # row now correctly stays at "Sent" for the Audit Trail to show.
+        command_id = self._audit_command(
+            pc, "cmd_screen_observe_start",
+            {"interval": interval, "quality": quality, "scale": scale},
+            admin, status="Sent")
+        msg.payload["command_id"] = command_id
         entry.send(msg)
-        self._audit_command(pc, "cmd_screen_observe_start",
-                            {"interval": interval, "quality": quality,
-                             "scale": scale}, admin, status="Done")
         self._log_activity(admin, "screen_observe_start", pc, f"interval={interval}s")
         return True
 
@@ -980,14 +1944,222 @@ class LabServer:
         ev = self.screen_watchers.pop(pc, None)
         if ev:
             ev.set()
+        # P1-8: audit FIRST so the client's ack (which already carries a
+        # command_id) resolves this row from Sent -> Done/Failed, instead
+        # of it being pre-stamped "Done" before the PC has been told.
+        command_id = self._audit_command(pc, "cmd_screen_observe_stop", {},
+                                         admin, status="Sent")
         if entry:
             entry.screen_streaming = False
             msg = build_screen_observe_stop()
             msg.payload["target_pc"] = pc
+            msg.payload["command_id"] = command_id
             entry.send(msg)
-        self._audit_command(pc, "cmd_screen_observe_stop", {}, admin, status="Done")
+        else:
+            # Nothing could be delivered at all - record that honestly
+            # instead of leaving an unresolved "Sent" row behind.
+            self._audit_done(command_id, False, "target not connected")
         self._log_activity(admin, "screen_observe_stop", pc, "")
         return True
+
+    # ---------------------------------------------------- remote control
+    def get_remote_session(self, pc):
+        """The active remote-control session for `pc`, or None."""
+        with self._remote_lock:
+            sess = self.remote_sessions.get(pc)
+            return dict(sess) if sess else None
+
+    def start_remote_control(self, pc, admin="", interval=0.4,
+                             quality=55, scale=0.7, role="") -> dict:
+        """Start a remote mouse/keyboard session (Task 5).
+
+        Reuses the existing command channel, the existing screen stream
+        and the existing `client_commands` audit table - no second network
+        stack.  The audit row's id becomes the SESSION id: it is handed to
+        the client with CMD_REMOTE_START and has to be echoed back on every
+        input batch, so input can never outlive the audited session that
+        authorised it.
+
+        P4: `role` must be the ADMINISTRATOR role.  This used to be a
+        promise made by the caller; it is now enforced here, at the
+        Server, so a STAFF or MAINTENANCE context is refused and audited
+        even if it reaches this method by some other route.  A refused
+        start writes exactly the same audit row as any other start that
+        did not happen, and never opens a stream.
+        """
+        from protocol import build_command
+        params = {"interval": interval, "quality": quality, "scale": scale,
+                  "admin_user": admin}
+        if not self._observe_role_ok(role, admin, "remote_control_start",
+                                     pc):
+            cid = self._audit_command(pc, "cmd_remote_start", params, admin)
+            self._audit_done(cid, False, "administrator role required")
+            return {"success": False,
+                    "error": "Remote Control requires the ADMINISTRATOR "
+                             "role",
+                    "command_id": cid}
+        entry = self.get_client(pc)
+        if not entry or not entry.is_online:
+            cid = self._audit_command(pc, "cmd_remote_start", params, admin)
+            self._audit_done(cid, False, f"{pc} is offline")
+            self._log_activity(admin, "remote_control_start", pc,
+                               "FAILED: client offline")
+            return {"success": False, "error": f"{pc} is offline",
+                    "command_id": cid}
+        # the person actually sitting at the PC - recorded in the audit row
+        client_user = str(getattr(entry, "logged_in_user", "") or "-")
+        with self._remote_lock:
+            existing = self.remote_sessions.get(pc)
+            if existing:
+                # one session per PC: never stack a second controller onto
+                # an already-controlled machine.
+                return {"success": True, "already": True,
+                        "command_id": existing.get("session_id"),
+                        "session_id": existing.get("session_id")}
+
+        # 1) the live screen the admin watches - the Observe stream itself.
+        if not self.start_screen_observe(pc, admin, interval, quality, scale,
+                                         role=role):
+            cid = self._audit_command(pc, "cmd_remote_start", params, admin)
+            self._audit_done(cid, False, f"{pc} is offline")
+            self._log_activity(admin, "remote_control_start", pc,
+                               "FAILED: client offline")
+            return {"success": False, "error": f"{pc} is offline",
+                    "command_id": cid}
+
+        # 2) audit FIRST, then arm the client with that same id.
+        cid = self._audit_command(pc, "cmd_remote_start", params, admin,
+                                  status="Sent")
+        msg = build_command(MessageType.CMD_REMOTE_START, pc, params,
+                            admin, cid)
+        if not entry.send(msg):
+            self._audit_done(cid, False, "send failed")
+            self.stop_screen_observe(pc, admin)
+            self._log_activity(admin, "remote_control_start", pc,
+                               "FAILED: send failed")
+            return {"success": False, "error": "Send failed",
+                    "command_id": cid}
+
+        with self._remote_lock:
+            self.remote_sessions[pc] = {
+                "admin": admin,
+                "session_id": cid,
+                "client_user": client_user,
+                "started_at": now_datetime(),
+            }
+        # explicit audit row for the Audit Trail's action column (the
+        # client_commands row above records the command itself).  It names
+        # every party and the connection type the spec asks for.
+        self._log_activity(admin, "remote_control_start", pc,
+                           f"session_id={cid} type=LAN "
+                           f"client_user={client_user} admin={admin or '-'}")
+        return {"success": True, "command_id": cid, "session_id": cid}
+
+    def stop_remote_control(self, pc, admin="", reason="stopped",
+                            stop_stream=True) -> dict:
+        """End the remote-control session for `pc` (Task 5).
+
+        Always writes the audit row - including when the Client is already
+        unreachable, so a session that ended in a disconnect still has a
+        start row, an end row, its id, the admin and a failure reason.
+        """
+        from protocol import build_command
+        with self._remote_lock:
+            sess = self.remote_sessions.pop(pc, None)
+        params = {"reason": str(reason or "stopped")}
+        if sess:
+            params["session_id"] = sess.get("session_id", "")
+        cid = self._audit_command(pc, "cmd_remote_stop", params,
+                                  admin or (sess or {}).get("admin", ""),
+                                  status="Sent")
+        entry = self.get_client(pc)
+        ok = False
+        if entry and entry.is_online and sess:
+            msg = build_command(MessageType.CMD_REMOTE_STOP, pc, {}, admin, cid)
+            # the client only obeys the stop for the session it is holding
+            msg.payload["session_id"] = sess.get("session_id", "")
+            ok = bool(entry.send(msg))
+        if not ok:
+            if not entry or not entry.is_online:
+                fail = "client offline - session force-ended"
+            else:
+                fail = "send failed"
+            self._audit_done(cid, False, reason or fail)
+        who = admin or (sess or {}).get("admin", "") or "system"
+        self._log_activity(
+            who, "remote_control_stop", pc,
+            ("" if sess else "no active session; ") +
+            f"result={'OK' if ok else 'FAILED'} reason={reason or 'stopped'} "
+            f"type=LAN client_user={(sess or {}).get('client_user', '-')}" +
+            (f" session_id={sess.get('session_id')}" if sess else ""))
+        if stop_stream:
+            self.stop_screen_observe(pc, who)
+        return {"success": ok or not bool(sess), "command_id": cid,
+                "session_id": (sess or {}).get("session_id", "")}
+
+    def end_remote_control_on_drop(self, pc) -> bool:
+        """Force-end a remote session the moment its Client disappears.
+
+        Called from the heartbeat sweep, the connection-closed path and
+        server shutdown.  The Client can never be reconnected back INTO an
+        active session: the session is gone from the table first, so a
+        re-register starts from a clean state.
+        """
+        with self._remote_lock:
+            sess = self.remote_sessions.pop(pc, None)
+        if not sess:
+            return False
+        cid = self._audit_command(pc, "cmd_remote_stop",
+                                  {"reason": "client disconnected",
+                                   "session_id": sess.get("session_id", "")},
+                                  sess.get("admin", "") or "system",
+                                  status="Sent")
+        self._audit_done(cid, False, "client disconnected - session ended")
+        self._log_activity(sess.get("admin") or "system",
+                           "remote_control_stop", pc,
+                           f"result=FAILED reason=client disconnected "
+                           f"client_user={sess.get('client_user', '-')} "
+                           f"session_id={sess.get('session_id', '')} type=LAN")
+        ev = self.screen_watchers.pop(pc, None)
+        if ev:
+            ev.set()
+        entry = self.get_client(pc)
+        if entry:
+            entry.screen_streaming = False
+        self._emit("remote_stopped", {"pc_name": pc,
+                                      "reason": "client disconnected"})
+        return True
+
+    def forward_remote_input(self, pc, events, admin="", role="") -> bool:
+        """Forward one whitelisted input batch to an ACTIVE remote session.
+
+        Nothing is sent - and therefore nothing can be applied on the
+        Client - unless ALL of these hold: the caller holds the
+        ADMINISTRATOR role (P4), a session exists for this exact PC, the
+        PC is online, and the batch survives
+        `protocol.sanitize_remote_events` (mouse move/click/scroll and key
+        down/up only).  This is a fire-and-forget data message on the
+        existing command channel; it is deliberately NOT a
+        `client_commands` row, since one audit row per mouse move would
+        drown the audit trail.  A REFUSED batch is audited once per PC and
+        role instead: a mouse move is not a security event, but an attempt
+        to drive a machine is.
+        """
+        from protocol import build_remote_input
+        if not self._observe_role_ok(role, admin, "remote_input_reject",
+                                     pc, once_key=(pc, str(role or "").lower())):
+            return False
+        with self._remote_lock:
+            sess = self.remote_sessions.get(pc)
+        if not sess:
+            return False
+        entry = self.get_client(pc)
+        if not entry or not entry.is_online:
+            return False
+        msg = build_remote_input(sess.get("session_id", ""), events)
+        if not msg.payload.get("events"):
+            return False                       # everything was filtered out
+        return bool(entry.send(msg))
 
     def broadcast_message(self, text, admin="", msg_type="admin") -> dict:
         results = {}

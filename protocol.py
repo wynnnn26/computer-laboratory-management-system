@@ -21,6 +21,9 @@ class MessageType(Enum):
     AUTH_REQUEST = "auth_request"
     AUTH_RESPONSE = "auth_response"
     AUTH_CHALLENGE = "auth_challenge"
+    # First-login password change (fresh client accounts)
+    PASSWORD_CHANGE_REQUEST = "password_change_request"
+    PASSWORD_CHANGE_RESPONSE = "password_change_response"
     
     # Client Registration & Heartbeat
     CLIENT_REGISTER = "client_register"
@@ -41,9 +44,24 @@ class MessageType(Enum):
     CMD_SCREENSHOT = "cmd_screenshot"
     CMD_SEND_MESSAGE = "cmd_send_message"
     CMD_EXECUTE = "cmd_execute"
+    CMD_WEB_FILTER = "cmd_web_filter"
+    # Remote control (Server -> Client) - Task 5.  These three are the ONLY
+    # messages that can ever move the remote machine's mouse or keyboard.
+    # CMD_REMOTE_INPUT carries a whitelisted list of input primitives
+    # (mouse move/click/scroll, key down/up) - there is deliberately no
+    # "type a string", no "run" and no shell/execute path behind it, so a
+    # compromised session still cannot inject commands.
+    CMD_REMOTE_START = "cmd_remote_start"
+    CMD_REMOTE_STOP = "cmd_remote_stop"
+    CMD_REMOTE_INPUT = "cmd_remote_input"
     
     # Responses (Client -> Server)
     CMD_RESPONSE = "cmd_response"
+
+    # Website Access policy ack (Client -> Server): "policy version N was
+    # applied" (or why it could not be) - the server only shows SYNCED
+    # after this arrives (spec item 8).
+    WEB_POLICY_ACK = "web_policy_ack"
     
     # Session Management
     SESSION_START = "session_start"
@@ -64,6 +82,21 @@ class MessageType(Enum):
     # Error
     ERROR = "error"
     PONG = "pong"
+
+
+# --------------------------------------------------------------------------
+# UDP LAN discovery: a Client broadcasts DISCOVER_MAGIC on
+# discovery_udp_port(tcp_port) (spec: 8444 = 8443 + 1); the Server answers
+# unicast with REPLY_MAGIC + its address. Pure convenience - the framed
+# JSON TCP channel stays the only data path.
+# --------------------------------------------------------------------------
+DISCOVER_MAGIC = "LAB_SYSTEM_DISCOVER"
+REPLY_MAGIC = "LAB_SYSTEM_SERVER"
+
+
+def discovery_udp_port(tcp_port) -> int:
+    """UDP discovery port for a TCP port (8443 -> 8444, spec)."""
+    return int(tcp_port) + 1
 
 
 @dataclass
@@ -266,6 +299,22 @@ def build_auth_response(success: bool, user_data: Dict = None, token: str = None
     return Message.create(MessageType.AUTH_RESPONSE, payload)
 
 
+def build_password_change(new_password: str) -> Message:
+    """Client -> Server: replace a default/first-login password.
+    The account identity is taken server-side from the authenticated TLS
+    entry, never from this payload - a client can only change its OWN
+    password, and only while authenticated on this link."""
+    return Message.create(MessageType.PASSWORD_CHANGE_REQUEST,
+                          {"new_password": new_password})
+
+
+def build_password_change_response(success: bool, error: str = None) -> Message:
+    payload = {"success": success}
+    if error:
+        payload["error"] = error
+    return Message.create(MessageType.PASSWORD_CHANGE_RESPONSE, payload)
+
+
 def build_client_register(pc_name: str, ip: str, hostname: str) -> Message:
     """Register a client PC. Only the fields the dashboard actually shows
     are transmitted (no bulky hardware specifications)."""
@@ -278,7 +327,8 @@ def build_client_register(pc_name: str, ip: str, hostname: str) -> Message:
 
 def build_client_heartbeat(pc_name: str, status: str, cpu: float, ram: float,
                            logged_in_user: str = None, session_id: str = None,
-                           ip: str = None, hostname: str = None) -> Message:
+                           ip: str = None, hostname: str = None,
+                           conn_type: str = None) -> Message:
     return Message.create(MessageType.CLIENT_HEARTBEAT, {
         "pc_name": pc_name,
         "status": status,  # "locked", "logged_in", "paused", "idle"
@@ -288,6 +338,46 @@ def build_client_heartbeat(pc_name: str, status: str, cpu: float, ram: float,
         "session_id": session_id,
         "ip": ip,
         "hostname": hostname,
+        # LAN medium ("Ethernet" / "Wi-Fi" / "LAN") - spec 14: the admin
+        # can see how each client reaches the server.
+        "conn_type": conn_type,
+    })
+
+
+def build_web_policy(version: int, mode: str, blocked=None, allowed=None,
+                     upstream_dns: str = "") -> Message:
+    """Server -> Client: the complete Website Access policy snapshot.
+
+    mode: "allow_all" | "block_list" | "allow_only" (per-PC, default from
+    system_settings).  Matching is suffix-based on the client
+    (example.com covers www./sub.example.com but never notexample.com)."""
+    return Message.create(MessageType.CMD_WEB_FILTER, {
+        "policy": {
+            "version": int(version),
+            "mode": mode,
+            "blocked": list(blocked or []),
+            "allowed": list(allowed or []),
+            "upstream_dns": upstream_dns,
+        },
+    })
+
+
+def build_web_policy_ack(version: int, mode: str, success: bool,
+                         enforced: str = "", error: str = None) -> Message:
+    """Client -> Server: acknowledge a policy version.
+
+    enforced: "detect" (connection detection attributes a live socket
+    to a domain and to the responsible browser, and closes only that
+    browser) or "none" (ALLOW ALL, or the policy could not be enforced
+    - in which case success=False and error says why).  The server
+    records SYNCED only when success=True (spec item 8 - never show
+    applied before the ack)."""
+    return Message.create(MessageType.WEB_POLICY_ACK, {
+        "version": int(version),
+        "mode": mode,
+        "success": bool(success),
+        "enforced": enforced,
+        "error": error,
     })
 
 
@@ -371,6 +461,86 @@ def build_screen_observe_start(interval: float = 1.0, quality: int = 50, scale: 
 
 def build_screen_observe_stop() -> Message:
     return Message.create(MessageType.CMD_SCREEN_OBSERVE_STOP, {})
+
+
+# --------------------------------------------------------------- remote I/O
+#: every mouse button the remote-control channel is allowed to press
+REMOTE_BUTTONS = (1, 2, 3)
+#: hard ceiling on one batch of input events (a flood can never queue up)
+REMOTE_MAX_EVENTS = 64
+#: the only mouse actions and key actions that may ever be forwarded
+REMOTE_MOUSE_ACTIONS = ("move", "down", "up", "scroll")
+REMOTE_KEY_ACTIONS = ("down", "up")
+
+
+def sanitize_remote_events(events) -> list:
+    """Whitelist one batch of remote input events.
+
+    This is THE security boundary of the remote-control feature: it is
+    applied on the server before a batch is sent AND on the client before
+    a batch is applied, so neither a buggy viewer nor a tampered message
+    can smuggle anything through.  Only these primitives survive:
+
+      * mouse  - move (to a NORMALISED x/y inside the streamed frame),
+                 button down/up on button 1/2/3, scroll with a clamped
+                 wheel delta;
+      * key    - a single key down/up identified by its Tk keysym.
+
+    There is no "type text", no "run", no shell/exec field - anything
+    unknown is dropped rather than passed along.
+    """
+    out: list = []
+    if not isinstance(events, (list, tuple)):
+        return out
+    for ev in events[:REMOTE_MAX_EVENTS]:
+        if not isinstance(ev, dict):
+            continue
+        kind = ev.get("kind")
+        action = ev.get("action")
+        if kind == "mouse" and action in REMOTE_MOUSE_ACTIONS:
+            try:
+                nx = float(ev.get("x"))
+                ny = float(ev.get("y"))
+            except (TypeError, ValueError):
+                continue
+            nx = min(1.0, max(0.0, nx))
+            ny = min(1.0, max(0.0, ny))
+            try:
+                button = int(ev.get("button", 1))
+            except (TypeError, ValueError):
+                button = 1
+            if button not in REMOTE_BUTTONS:
+                button = 1
+            try:
+                delta = float(ev.get("delta", 1.0))
+            except (TypeError, ValueError):
+                delta = 1.0
+            delta = min(4.0, max(-4.0, delta))
+            out.append({"kind": "mouse", "action": action,
+                        "x": nx, "y": ny, "button": button,
+                        "delta": delta})
+        elif kind == "key" and action in REMOTE_KEY_ACTIONS:
+            keysym = str(ev.get("keysym") or "")[:24]
+            if not keysym:
+                continue
+            char = str(ev.get("char") or "")[:8]
+            out.append({"kind": "key", "action": action,
+                        "keysym": keysym, "char": char})
+    return out[:REMOTE_MAX_EVENTS]
+
+
+def build_remote_input(session_id: str, events) -> Message:
+    """Forward a whitelisted batch of mouse/keyboard events.
+
+    `session_id` is the id of the audited CMD_REMOTE_START command that
+    armed this session; the client refuses every batch whose id it does
+    not currently hold, so input can never outlive the session it belongs
+    to.
+    """
+    return Message.create(MessageType.CMD_REMOTE_INPUT, {
+        "session_id": str(session_id or ""),
+        "events": sanitize_remote_events(events),
+    })
 
 
 def build_send_message(message: str, msg_type: str = "admin") -> Message:
