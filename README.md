@@ -1,5 +1,11 @@
 # Computer Laboratory Management System — LAN Edition
 
+> **How it works:** see [ARCHITECTURE.md](ARCHITECTURE.md) for a full
+> walkthrough of the runtime architecture — startup and mode detection, the
+> TLS message protocol, authentication/session flow, server and client
+> lifecycles, Website Access enforcement, database schema, UI layer and the
+> build/test pipeline.
+
 A desktop application (Python + CustomTkinter + SQLite + TCP/TLS sockets) for
 managing a school computer laboratory / internet café over a **LAN only**
 (no cloud, no REST API), inspired by PanCafe Pro:
