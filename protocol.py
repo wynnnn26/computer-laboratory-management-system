@@ -150,10 +150,28 @@ class TLSSocketWrapper:
         self._lock = threading.Lock()
     
     def send_message(self, msg: Message) -> bool:
-        """Send a framed message. Returns True on success."""
+        """Send a framed message. Returns True on success.
+
+        Sends always run on a BLOCKING socket: recv_message() parks the
+        shared socket in a short poll timeout (0.5 s in the client and
+        server loops), and since Python 3.5 that timeout is the MAXIMUM
+        TOTAL DURATION of a sendall() - so a large screen frame that
+        cannot be written inside the window on a momentarily congested
+        link would raise socket.timeout mid-send and be misread as a
+        dead connection, dropping the link (and any active remote-
+        control session) for no reason.  The reader's timeout is saved
+        and restored around the send; recv_message() re-asserts its own
+        timeout at the top of every call anyway.
+        """
         try:
+            data = msg.to_bytes()
             with self._lock:
-                self.sock.sendall(msg.to_bytes())
+                old_timeout = self.sock.gettimeout()
+                self.sock.settimeout(None)
+                try:
+                    self.sock.sendall(data)
+                finally:
+                    self.sock.settimeout(old_timeout)
             return True
         except Exception as e:
             print(f"Send error: {e}")

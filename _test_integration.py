@@ -1729,6 +1729,49 @@ check("P4: the P4 test session is closed again",
       "TEST-PC" not in srv.remote_sessions
       and "TEST-PC" not in srv.screen_watchers, str(list(srv.remote_sessions)))
 
+# --- connection resilience: a send must not inherit the reader's poll timeout
+# recv_message() parks the SHARED socket in a short timeout (0.5 s in the
+# live loops), and since Python 3.5 that timeout is the MAX TOTAL duration
+# of sendall() - so a large screen frame on a momentarily congested link
+# would raise socket.timeout mid-send and be misread as a dead server,
+# dropping the connection (and the active remote session) for no reason.
+# send_message() must send BLOCKING and restore the reader's timeout.
+import socket as _sockmod
+_pa, _pb = _sockmod.socketpair()
+_wx = TLSSocketWrapper(_pa)
+_wx.recv_message(timeout=0.1)                # idle -> None; parks at 0.1 s
+class _SendSpy:
+    """Stand-in socket that records the timeout in effect during sendall."""
+    def __init__(self, real):
+        self._real = real
+        self.seen = []
+    def sendall(self, data):
+        self.seen.append(self._real.gettimeout())
+        return self._real.sendall(data)
+    def gettimeout(self):
+        return self._real.gettimeout()
+    def settimeout(self, value):
+        return self._real.settimeout(value)
+    def close(self):
+        return self._real.close()
+_spy = _SendSpy(_pa)
+_wx.sock = _spy
+_ok_send = _wx.send_message(Message.create(MessageType.CMD_SCREEN_OBSERVE_STOP, {}))
+_wx.sock = _pa
+check("[conn] send_message reports success on a healthy socket", _ok_send is True)
+check("[conn] the send itself runs on a BLOCKING socket (no recv timeout)",
+      _spy.seen == [None], str(_spy.seen))
+check("[conn] the reader's timeout is restored after the send",
+      _pa.gettimeout() is not None and abs(_pa.gettimeout() - 0.1) < 1e-9,
+      str(_pa.gettimeout()))
+_pb.settimeout(2.0)
+try:
+    _got = len(_pb.recv(65536)) > 0
+except OSError:
+    _got = False
+check("[conn] the frame reaches the peer", _got)
+_wx.close(); _pb.close()
+
 # ---------------------------------------------------------------- sessions
 def attendance_today():
     c = database.get_connection()
@@ -2019,6 +2062,45 @@ check("sidebar replaces notebook tabs", not hasattr(dash, "notebook"),
 check("Client PCs page present", "clients" in dash._sidebar_btns)
 check("sidebar menu has >= 12 entries", len(dash._sidebar_btns) >= 12,
       str(len(dash._sidebar_btns)))
+# --- Remote viewer coordinate mapping (cursor-accuracy regression) --------
+# CTkLabel.bind() delivers events from the label's INTERNAL tk widgets (the
+# image-sized label under the pointer, or the full-size canvas in the
+# margins), so event.x/y live in two different spaces.  _remote_norm must
+# normalise the ABSOLUTE pointer position against the photo's origin: a
+# synthetic pointer at a known point of a photo smaller than the label has
+# to come back as exactly that point - the old outer-label formula shifted
+# it by the centring offset (measured -9 % / -13 % on a 1440x810 frame).
+import types as _types
+from PIL import Image as _PILImage, ImageTk as _PILImageTk
+_rw = _ctk.CTkToplevel(root)
+_rl = _ctk.CTkLabel(_rw, fg_color="#0d1117", text="Waiting for frames...")
+_rl.pack(fill="both", expand=True, padx=8, pady=8)
+_rw.label = _rl                                  # what _remote_norm reads
+_rp = _PILImageTk.PhotoImage(_PILImage.new("RGB", (320, 180), (30, 60, 120)))
+_rl.configure(image=_rp, text="")
+_rl.image = _rp
+_rw.geometry("1150x780+60+60")
+root.update(); root.update_idletasks()
+_iw, _ih = _rp.width(), _rp.height()
+_lw, _lh = _rl.winfo_width(), _rl.winfo_height()
+check("[remote] test photo fits inside the viewer label",
+      100 <= _iw <= _lw and 50 <= _ih <= _lh, f"photo {_iw}x{_ih} label {_lw}x{_lh}")
+_ox = _rl.winfo_rootx() + (_lw - _iw) // 2
+_oy = _rl.winfo_rooty() + (_lh - _ih) // 2
+_mid = dash._remote_norm(_rw, _types.SimpleNamespace(
+    x_root=_ox + _iw // 2, y_root=_oy + _ih // 2))
+check("[remote] centre of the photo maps to (0.5, 0.5)",
+      _mid is not None and abs(_mid[0] - 0.5) < 0.01 and abs(_mid[1] - 0.5) < 0.01,
+      str(_mid))
+_pt75 = dash._remote_norm(_rw, _types.SimpleNamespace(
+    x_root=_ox + int(_iw * 0.75), y_root=_oy + int(_ih * 0.6)))
+check("[remote] a point at 75 % / 60 % maps exactly",
+      _pt75 is not None and abs(_pt75[0] - 0.75) < 0.01
+      and abs(_pt75[1] - 0.6) < 0.01, str(_pt75))
+check("[remote] a pointer left of the picture is never forwarded",
+      dash._remote_norm(_rw, _types.SimpleNamespace(
+          x_root=_ox - 10, y_root=_oy + 5)) is None)
+_rw.destroy()
 # --- spec 1: header keeps Logout, Minimize button removed -------------------
 def _is_button(w):
     """A pressable button.

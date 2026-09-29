@@ -1847,11 +1847,19 @@ class AdminDashboard(ctk.CTkToplevel):
         win.bind("<ButtonPress>", lambda e: win.focus_set())
 
     @staticmethod
-    def _remote_norm(win, x, y):
-        """Viewer pixel -> 0..1 position inside the streamed frame.
+    def _remote_norm(win, event):
+        """Viewer pointer -> 0..1 position inside the streamed frame.
 
-        Normalised coordinates survive any capture scale and any viewer
-        size, so the Client can map them onto its own screen exactly.
+        CTkLabel.bind() delivers events from the label's INTERNAL tk
+        widgets - the image-sized label under the pointer, or the full
+        size canvas in the margins - so event.x/event.y live in two
+        different coordinate spaces and can never be compared against
+        the outer label geometry directly (that double-subtracts the
+        image centring offset and lands the remote cursor up to ~10 %
+        off).  Normalising the ABSOLUTE pointer position (x_root/y_root)
+        against the photo's absolute origin is correct no matter which
+        widget delivered the event: the photo is always grid-centred in
+        the label, so its top-left is label_root + (label - photo) / 2.
         Returns None for anything outside the picture (never forwarded).
         """
         photo = getattr(win.label, "image", None)
@@ -1863,9 +1871,14 @@ class AdminDashboard(ctk.CTkToplevel):
             return None
         if iw <= 0 or ih <= 0:
             return None
-        lw, lh = win.label.winfo_width(), win.label.winfo_height()
-        nx = (x - (lw - iw) // 2) / float(iw)
-        ny = (y - (lh - ih) // 2) / float(ih)
+        try:
+            lw, lh = win.label.winfo_width(), win.label.winfo_height()
+            ox = win.label.winfo_rootx() + (lw - iw) // 2
+            oy = win.label.winfo_rooty() + (lh - ih) // 2
+            nx = (event.x_root - ox) / float(iw)
+            ny = (event.y_root - oy) / float(ih)
+        except Exception:
+            return None
         if not (0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0):
             return None
         return nx, ny
@@ -1890,7 +1903,7 @@ class AdminDashboard(ctk.CTkToplevel):
         if now - getattr(self, "_remote_last_move", 0.0) < 0.03:
             return "break"
         self._remote_last_move = now
-        pt = self._remote_norm(self._remote_win, event.x, event.y)
+        pt = self._remote_norm(self._remote_win, event)
         if pt:
             self._remote_send({"kind": "mouse", "action": "move",
                                "x": pt[0], "y": pt[1], "button": 1,
@@ -1900,7 +1913,7 @@ class AdminDashboard(ctk.CTkToplevel):
     def _on_remote_button(self, event, button, action):
         if not self._remote_pc:
             return
-        pt = self._remote_norm(self._remote_win, event.x, event.y)
+        pt = self._remote_norm(self._remote_win, event)
         if pt:
             self._remote_send({"kind": "mouse", "action": action,
                                "x": pt[0], "y": pt[1], "button": button,
@@ -1910,7 +1923,7 @@ class AdminDashboard(ctk.CTkToplevel):
     def _on_remote_wheel(self, event):
         if not self._remote_pc:
             return
-        pt = self._remote_norm(self._remote_win, event.x, event.y)
+        pt = self._remote_norm(self._remote_win, event)
         if pt:
             self._remote_send({"kind": "mouse", "action": "scroll",
                                "x": pt[0], "y": pt[1], "button": 1,
@@ -2370,9 +2383,18 @@ class AdminDashboard(ctk.CTkToplevel):
             from PIL import Image, ImageTk
             raw = base64.b64decode(img_b64)
             img = Image.open(io.BytesIO(raw))
-            # scale the frame down only if it does not fit the viewer
-            avail_w = win.winfo_width() - 24
-            avail_h = win.winfo_height() - 24
+            # scale the frame down only if it does not fit the viewer.
+            # Measure the LABEL the picture is drawn in (not the window):
+            # the label is shorter than the window by the header bar, so
+            # sizing against the window could overflow the label and clip
+            # the bottom of the stream.
+            lbl = getattr(win, "label", None)
+            avail_w = (lbl.winfo_width() - 4) if lbl is not None else -1
+            avail_h = (lbl.winfo_height() - 4) if lbl is not None else -1
+            if avail_w < 100:
+                avail_w = win.winfo_width() - 24
+            if avail_h < 100:
+                avail_h = win.winfo_height() - 24
             if avail_w < 100:
                 avail_w = 1150 - 24
             if avail_h < 100:

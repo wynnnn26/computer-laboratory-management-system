@@ -2903,9 +2903,14 @@ class ClientApp(ctk.CTk):
             dx = int(round(float(ev["x"]) * 65535))
             dy = int(round(float(ev["y"]) * 65535))
             action = ev.get("action")
-            # park the cursor first so a click lands where the admin clicked
-            u32.mouse_event(MOUSE_ABSOLUTE | MOUSE_VIRTUALDESK | MOUSE_MOVE,
-                            dx, dy, 0, 0)
+            # Park the cursor first so a click lands where the admin
+            # clicked.  MOVED | ABSOLUTE maps 0-65535 onto the PRIMARY
+            # screen - exactly what ImageGrab.grab() captures for the
+            # stream.  VIRTUALDESK would spread the same coordinates
+            # over the entire virtual desktop instead, so on a machine
+            # with a second monitor (or a phantom display) every click
+            # would land left of / above the intended spot.
+            u32.mouse_event(MOUSE_ABSOLUTE | MOUSE_MOVE, dx, dy, 0, 0)
             if action == "move":
                 return True
             if action == "scroll":
@@ -3446,6 +3451,15 @@ class ClientApp(ctk.CTk):
     def _tick(self):
         """1-second UI ticker: clock, pause text, heartbeat."""
         self._collapse_timer("_after_tick")   # single chain, never orphaned
+        # Re-arm FIRST: whatever the body below does - even if a widget
+        # call raises - the ticker (and with it the 5 s heartbeat that
+        # keeps this PC online in the Server's sweep) must survive.  The
+        # old code scheduled the next tick LAST, so one exception
+        # silently killed every future heartbeat.
+        try:
+            self._after_tick = self.after(1000, self._tick)
+        except Exception:
+            self._after_tick = None
         # keep the login card's server indicator + PC footer current
         self._refresh_login_status()
         # local log queue: periodic flush while connected (spec item 11;
@@ -3488,16 +3502,18 @@ class ClientApp(ctk.CTk):
                 self.pause_count_lbl.configure(
                     text="Waiting for the administrator to resume…")
 
-        # heartbeat every 5 s (server ACKs each one - that is also how we
-        # detect a restarted/dead server and reconnect automatically)
-        if int(time.time()) % 5 == 0 and getattr(self, "_last_hb", 0) != int(time.time()):
-            self._last_hb = int(time.time())
+        # Heartbeat every 5 s (server ACKs each one - that is also how we
+        # detect a restarted/dead server and reconnect automatically).
+        # ELAPSED-based: the old `int(time) % 5 == 0` check only fired in
+        # the exact second whose remainder was 0, so under load (remote
+        # frame decoding on this same Tk thread) a late tick could skip
+        # that second entirely and push the next heartbeat 5-10 s out -
+        # two skips in a row exceeded the Server's 15 s sweep and the PC
+        # was marked offline mid-session.  Elapsed time can never skip.
+        now = time.time()
+        if now - getattr(self, "_last_hb", 0.0) >= 5.0:
+            self._last_hb = now
             self._send_heartbeat(cpu, ram)
-
-        try:
-            self._after_tick = self.after(1000, self._tick)
-        except Exception:
-            self._after_tick = None
 
     def _pulse_metrics(self):
         pass    # metrics are refreshed in _tick
