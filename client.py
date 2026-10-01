@@ -3558,8 +3558,9 @@ class ClientApp(ctk.CTk):
 # Windows startup registration (P2): HKCU Run - per-user (no admin rights),
 # idempotent, name "Computer Laboratory Client"
 # ==========================================================================
-STARTUP_VALUE_NAME = "Computer Laboratory Client"
-STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+# one source of truth with dist\uninstall.exe: the uninstaller removes
+# EXACTLY these names, so both sides import them from startup_ids
+from startup_ids import STARTUP_VALUE_NAME, STARTUP_KEY_PATH
 
 
 def _startup_command():
@@ -3625,8 +3626,7 @@ def remove_startup_registration():
 # service and no third-party binary - and a stray tick can never open a
 # second fullscreen lock screen over the first one.
 # ==========================================================================
-WATCHDOG_TASK_LOGON = "Computer Laboratory Client Logon"
-WATCHDOG_TASK_REPEAT = "Computer Laboratory Client Watchdog"
+from startup_ids import WATCHDOG_TASK_LOGON, WATCHDOG_TASK_REPEAT
 _SCHTASKS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 

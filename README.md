@@ -130,7 +130,9 @@ managing a school computer laboratory / internet café over a **LAN only**
 - **Uninstall Client:** from *Server Settings*, an `admin` or
   `maintenance` account can export the local log to a CSV and remove the
   PC's Windows auto-start and watchdog tasks, behind a confirmation.
-  It never deletes the application files or the database.
+  It never deletes the application files or the database. For a full
+  removal there is also the standalone **`dist\uninstall.exe`** (see
+  *Client lifecycle* below).
 - Every user session, client event and admin/staff action is recorded in
   the database (sessions table + activity audit log + command audit
   table) and is searchable/filterable in the **Audit Trail**.
@@ -372,7 +374,12 @@ with.
   *Server Settings → Maintenance → [Uninstall Client]* (admin and
   maintenance roles only, behind a confirmation), which exports the
   local log to a CSV first. Neither path ever deletes application files
-  or the database.
+  or the database. The standalone **`dist\uninstall.exe`** (built by
+  `build_exe.bat`, requests admin) is the path that does: it removes
+  both watchdog tasks and the Startup entry, **stops every running
+  `client.exe`**, exports the local log to a CSV, deletes the client
+  files (`client.exe`, `lab_client.db*`, `lab_config.json`) and finally
+  deletes itself — each step reported honestly in a result dialog.
 - **Panic stop (Ctrl+Shift+Alt+K):** delivered by the same low-level
   keyboard hook that swallows the bypass hotkeys, with a `bind_all`
   fallback. It only ever acts while the kiosk is *unlocked*: screen
@@ -533,10 +540,21 @@ and `maintenance` accounts: it exports the local log to a CSV first,
 then removes the Startup entry and the watchdog tasks — application
 files and the database are never deleted.
 
-Both executables bundle the assets they need: the single official logo
-`assets/images/logo.png` (window and login branding), `app_icon.ico`
-(the `.exe` file icon and the title-bar/taskbar icon) and the eight
-`pc_icons/*.png` status icons.
+To take the Client off a lab PC completely, run **`uninstall.exe`**
+(next to the Client, or copy it there from `dist\`): it removes the two
+watchdog tasks and the Startup entry, stops any running `client.exe`,
+exports the local log to a CSV, deletes the Client files
+(`client.exe`, `lab_client.db*`, `lab_config.json`) and then deletes
+itself. It asks for admin rights because an elevated Client can only
+be stopped from an elevated process; if a step fails it says so
+instead of pretending — fix the reported line (usually: run it as
+Administrator) and run it again. Run it as the user who used the
+Client; the Startup entry is per-user.
+
+`server.exe` and `client.exe` bundle the assets they need: the single
+official logo `assets/images/logo.png` (window and login branding),
+`app_icon.ico` (the `.exe` file icon and the title-bar/taskbar icon)
+and the eight `pc_icons/*.png` status icons.
 
 ## Tests
 

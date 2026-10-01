@@ -70,6 +70,7 @@ decides which one it is; nothing else needs to change.
 | Entry / launcher | `main.py` | Mode detection (`_detected_mode` :35), server launcher (`run_server_mode` :316), `LoginWindow` (:126) |
 | Server core | `server.py` (2.1k lines) | `LabServer` (:209): accept loop, auth, heartbeats, commands, observe/remote, website policy, audit |
 | Client core | `client.py` (3.8k lines) | `ClientApp` kiosk (:1057), `ClientNetwork` (:416), command handlers, watchdog/startup, offline mode |
+| Uninstaller | `uninstall.py`, `startup_ids.py` | Standalone `dist\uninstall.exe` (`--uac-admin`): watchdog tasks → Run entry → stop `client.exe` → export log CSV → delete client files → self-delete; `startup_ids.py` is the single source of the auto-start names both sides share |
 | Wire protocol | `protocol.py` | `MessageType` enum (:19), `Message` framing (:103), TLS helpers (:210), self-signed cert generation (:228), message builders (:281-565) |
 | Server database | `database.py` | Schema (:58-241), migrations (:244), PBKDF2 hashing (:40), seeding + settings (:408-516) |
 | Client database | `local_store.py` | Offline log queue + auth roster cache (:64-384) |
@@ -78,7 +79,7 @@ decides which one it is; nothing else needs to change.
 | Student UI | `student_dashboard.py` | Announcements / messages / borrowing (:38) |
 | Data bridge | `client_api.py` | Network-first fetches for the student UI with SQLite fallback (:17) |
 | UI framework | `components.py`, `theme.py`, `utils.py`, `crud_frame.py` | Shared widgets, design tokens, styling helpers, reusable CRUD tables/pages |
-| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py` | 486 + 251 + 50 checks, self-contained |
+| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py` | 501 + 251 + 50 checks, self-contained |
 | Build | `build_exe.bat`, `requirements.txt` | PyInstaller onefile builds for both apps |
 | Assets | `assets/`, `pc_icons/`, `app_icon.ico` | Logo, 8 PC status icons, window icon |
 | Design docs | `design-system/lab-management-system/MASTER.md` | Token/component spec behind `theme.py` |
@@ -416,7 +417,7 @@ exiting non-zero on any failure:
 
 | Suite | Checks | Covers |
 |---|---|---|
-| `_test_integration.py` | **486** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands, dashboard layout, role gating |
+| `_test_integration.py` | **501** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands, dashboard layout, role gating, guardrails, the standalone uninstaller |
 | `_test_client_gui.py` | **251** | kiosk state machine, lock/pause/logout, command de-dup, offline login + local queue, web policy ack, watchdog, hotkeys, observe clamps |
 | `_probe_layout.py` | **50** | responsive layout at 1080×700 / 1280×780 / 1440×900 |
 

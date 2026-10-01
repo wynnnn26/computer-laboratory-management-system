@@ -3903,6 +3903,29 @@ check("guardrail G8: every safety guardrail holds",
       not [f for f in FAIL if f.startswith("guardrail")],
       str([f for f in FAIL if f.startswith("guardrail")]))
 
+# ---- standalone uninstall (dist\uninstall.exe) ---------------------------
+# The uninstaller must remove EXACTLY what the Client registers, so both
+# sides import the names from startup_ids - and it must never do its work
+# at import time.
+import startup_ids as _sids
+import uninstall as _un
+check("[uninstall] shares the exact auto-start ids with the Client",
+      _un.WATCHDOG_TASK_LOGON == client_mod.WATCHDOG_TASK_LOGON
+      == _sids.WATCHDOG_TASK_LOGON
+      and _un.WATCHDOG_TASK_REPEAT == client_mod.WATCHDOG_TASK_REPEAT
+      and _un.STARTUP_VALUE_NAME == client_mod.STARTUP_VALUE_NAME
+      and _un.STARTUP_KEY_PATH == client_mod.STARTUP_KEY_PATH,
+      f"{_un.WATCHDOG_TASK_LOGON!r}/{_un.STARTUP_VALUE_NAME!r}")
+check("[uninstall] covers every artifact a Client install owns",
+      _un.CLIENT_IMAGE == "client.exe"
+      and "client.exe" in _un.CLIENT_FILE_PATTERNS
+      and "lab_client.db*" in _un.CLIENT_FILE_PATTERNS
+      and "lab_config.json" in _un.CLIENT_FILE_PATTERNS,
+      str(_un.CLIENT_FILE_PATTERNS))
+check("[uninstall] imports without side effects (all work lives in main)",
+      callable(_un.main) and callable(_un.stop_client)
+      and callable(_un.export_and_remove_files), "import-only")
+
 # ---------------------------------------------------------------- teardown
 stop_reader.set()
 stop3.set()
