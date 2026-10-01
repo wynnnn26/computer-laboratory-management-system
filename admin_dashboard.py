@@ -859,7 +859,8 @@ class AdminDashboard(ctk.CTkToplevel):
         all_states = self._pc_states()
         vis = self._filter_sort(all_states)
         sig = (tuple((str(s.get("pc_name")), status_key(s.get("state")),
-                      str(s.get("logged_in_user") or "")) for s in vis),
+                      str(s.get("logged_in_user") or ""),
+                      str(s.get("account_full_name") or "")) for s in vis),
                self.pc_search_var.get() if hasattr(self, "pc_search_var") else "",
                self.pc_sort_var.get() if hasattr(self, "pc_sort_var") else "",
                self._pc_status_filter)
@@ -919,6 +920,29 @@ class AdminDashboard(ctk.CTkToplevel):
         except Exception:
             pass
 
+    def _pc_user_label(self, info):
+        """Who is at this PC, shown as a NAME (e.g. "Juan Dela Cruz"),
+        not the login id.
+
+        Sources in trust order: the server-authoritative account full
+        name on the state entry (set at session start), then the users
+        row for the last login (covers offline rows that only know the
+        id), then the raw id / "None" - an honest fallback is better
+        than a blank line.  Never raises."""
+        full = str(info.get("account_full_name") or "").strip()
+        uid = str(info.get("logged_in_user") or "").strip()
+        if not full and uid:
+            try:
+                conn = get_connection()
+                row = conn.execute(
+                    "SELECT full_name FROM users WHERE student_id=?",
+                    (uid,)).fetchone()
+                conn.close()
+                full = str(row["full_name"] or "") if row else ""
+            except Exception:
+                full = ""
+        return full or uid or "None"
+
     def _make_pc_card(self, info):
         """One PC card - the status monitor icon is the centerpiece
         (spec example):
@@ -927,7 +951,7 @@ class AdminDashboard(ctk.CTkToplevel):
             PC-01
             ONLINE
             IP: 192.168.0.101
-            User: None
+            User: Juan Dela Cruz
 
         The selection highlight is a ring - it never touches the status
         color or the icon (no icon distortion)."""
@@ -954,9 +978,10 @@ class AdminDashboard(ctk.CTkToplevel):
         ip = str(info.get("ip") or "\u2014")
         ctk.CTkLabel(card, text=f"IP: {ip}", font=FONT_SMALL,
                  text_color="#5a6480", fg_color="white", justify="center").pack(pady=(5, 0))
-        user = info.get("logged_in_user") or "None"
+        user = self._pc_user_label(info)
         ctk.CTkLabel(card, text=f"User: {user}", font=FONT_SMALL,
-                 text_color="#5a6480", fg_color="white", justify="center").pack()
+                 text_color="#5a6480", fg_color="white", justify="center",
+                 wraplength=140).pack()
         self._pc_cards[name] = {"frame": card, "icon": icon, "state": state,
                                 "info": info}
         if name in self._selected_pcs:

@@ -3578,6 +3578,16 @@ check("PC card shows status + IP + user",
       and any(t in ("ONLINE", "OFFLINE", "IN USE", "PAUSED", "LOCKED",
                     "AVAILABLE", "VERIFYING", "UNKNOWN") for t in card_texts),
       str(card_texts))
+check("[card] PC card shows the person's full name, not the login id",
+      dash._pc_user_label({"account_full_name": "Juan Dela Cruz",
+                           "logged_in_user": "2023-00001"})
+      == "Juan Dela Cruz"
+      and dash._pc_user_label({"logged_in_user": "2023-00001"})
+      == "Juan Dela Cruz"           # users-row fallback for offline PCs
+      and dash._pc_user_label({"logged_in_user": "ghost42"}) == "ghost42"
+      and dash._pc_user_label({}) == "None",
+      str(dash._pc_user_label({"account_full_name": "Juan Dela Cruz",
+                               "logged_in_user": "2023-00001"})))
 check("grid card icon keeps its square size",
       dash._pc_cards[first_pc]["icon"] is not None
       and dash._pc_cards[first_pc]["icon"].width() == 44
