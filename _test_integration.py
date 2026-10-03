@@ -3232,8 +3232,9 @@ check("Accounts page has Search/Status/Course filters + Clear",
                              "clear_filters") if hasattr(_acf, a))))
 check("Accounts page has the contextual action buttons",
       all(t in _all_button_texts(_acf)
-          for t in ("+ Add Account", "View Details", "Edit Selected",
-                    "Delete Selected", "Refresh", "Export CSV", "Clear")),
+          for t in ("+ Add Account", "Bulk Upload", "View Details",
+                    "Edit Selected", "Delete Selected", "Refresh",
+                    "Export CSV", "Clear")),
       str(_all_button_texts(_acf)))
 
 _acr = _trows(_acf.tree)
@@ -3452,6 +3453,77 @@ _mb.askyesno = _orig_yesno_c
 check("delete reports through the account_changed hook (toast)",
       any("Account delete" in str(t) for _k, t in _toasts_ac),
       str(_toasts_ac))
+
+# ---- Bulk Upload: CSV import - validation, dedupe, default password ------
+import csv as _csv
+_bulk_dir = tempfile.mkdtemp(prefix="bulk_csv_")
+_bulk_path = os.path.join(_bulk_dir, "accounts.csv")
+with open(_bulk_path, "w", newline="", encoding="utf-8") as _fh:
+    _bw = _csv.writer(_fh)
+    _bw.writerow(["Student ID", "Full Name", "Password", "Course",
+                  "Year Level", "Email", "Contact", "Status"])
+    _bw.writerow(["bulk1", "Bulk One", "", "BSIT", "1st Year", "", "", ""])
+    _bw.writerow(["bulk2", "Bulk Two", "bulk-pw-2", "", "", "", "",
+                  "inactive"])
+    _bw.writerow(["bulk1", "Dup In File", "", "", "", "", "", ""])
+    _bw.writerow(["2023-00001", "Already Here", "", "", "", "", "", ""])
+    _bw.writerow(["", "Missing ID", "", "", "", "", "", ""])
+    _bw.writerow(["bulk3", "", "", "", "", "", "", ""])
+    _bw.writerow(["", "", "", "", "", "", "", ""])   # filler: not counted
+_toasts_ac.clear()
+_bulk = _acf.import_accounts_csv(_bulk_path)
+_bulk_rows = {r["student_id"]: dict(r) for r in database.get_connection(
+).execute(
+    "SELECT student_id, password, role, must_change_password, status,"
+    " full_name FROM users WHERE student_id IN ('bulk1','bulk2')")}
+check("bulk upload adds valid rows and counts skips + errors",
+      isinstance(_bulk, dict)
+      and _bulk["added"] == ["bulk1", "bulk2"]
+      and len(_bulk["skipped"]) == 2 and len(_bulk["errors"]) == 2
+      and any("Account created" in str(t) for _k, t in _toasts_ac),
+      str(_bulk))
+check("bulk rows keep the add-form write rules (default password, flag)",
+      set(_bulk_rows) == {"bulk1", "bulk2"}
+      and all(r["role"] == "student" and r["must_change_password"] == 1
+              for r in _bulk_rows.values())
+      and database.verify_password(database.DEFAULT_CLIENT_PASSWORD,
+                                   _bulk_rows["bulk1"]["password"])
+      and database.verify_password("bulk-pw-2",
+                                   _bulk_rows["bulk2"]["password"])
+      and _bulk_rows["bulk1"]["status"] == "Active"
+      and _bulk_rows["bulk2"]["status"] == "Inactive"
+      and _bulk_rows["bulk2"]["full_name"] == "Bulk Two",
+      str(_bulk_rows))
+check("bulk summary + toasts never leak a password",
+      all(database.DEFAULT_CLIENT_PASSWORD not in s
+          and "bulk-pw-2" not in s
+          for s in (_bulk["added"] + _bulk["skipped"] + _bulk["errors"]))
+      and all(database.DEFAULT_CLIENT_PASSWORD not in str(t)
+              and "bulk-pw-2" not in str(t) for _k, t in _toasts_ac),
+      str(_bulk))
+check("bulk upload leaves the existing account untouched",
+      database.get_connection().execute(
+          "SELECT full_name FROM users WHERE student_id='2023-00001'"
+      ).fetchone()["full_name"] == "Juan Dela Cruz",
+      "2023-00001 full name checked")
+_bad_path = os.path.join(_bulk_dir, "bad.csv")
+with open(_bad_path, "w", newline="", encoding="utf-8") as _fh:
+    _bw = _csv.writer(_fh)
+    _bw.writerow(["Name", "Marks"])
+    _bw.writerow(["bulk9", "x"])
+_toasts_ac.clear()
+_bad = _acf.import_accounts_csv(_bad_path)
+_bad_row = database.get_connection().execute(
+    "SELECT 1 FROM users WHERE student_id='bulk9'").fetchone()
+check("a CSV without the required columns is refused, nothing imported",
+      _bad is None and _bad_row is None
+      and any("header" in str(t) for _k, t in _toasts_ac),
+      str(_toasts_ac))
+# bulk fixtures never outlive this block
+conn = database.get_connection()
+conn.execute("DELETE FROM users WHERE student_id IN ('bulk1','bulk2')")
+conn.commit()
+conn.close()
 
 # cleanup: the account fixtures never outlive this block
 conn = database.get_connection()

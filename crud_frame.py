@@ -6,10 +6,11 @@ computers, inventory, borrowing, maintenance, announcements, sessions)
 is built from this one class, configured differently.
 """
 
+import csv
 from datetime import datetime
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from database import (get_connection, hash_password, get_setting,
                       DEFAULT_CLIENT_PASSWORD)
 from utils import (export_rows_to_csv, FONT_HEADER, ACCENT, ORANGE, now_date,
@@ -1762,6 +1763,10 @@ class AccountsFrame(ctk.CTkFrame):
                 ("Contact No.:", "contact"), ("Status:", "_status"),
                 ("Must Change Password:", "_mcp"),
                 ("Created:", "created_at"))
+    # bulk upload: the CSV columns that may be written (anything else in
+    # the file - e.g. the export's Session column - is ignored)
+    BULK_FIELDS = ("student_id", "password", "full_name", "course",
+                   "year_level", "email", "contact", "status")
 
     def __init__(self, parent, on_change=None, notify=None):
         super().__init__(parent)
@@ -1824,6 +1829,8 @@ class AccountsFrame(ctk.CTkFrame):
                   cursor="hand2",
                   font=("Segoe UI", 9, "bold"), ).pack(
             side="right")
+        ctk.CTkButton(bar, text="Bulk Upload",
+                   command=self.bulk_upload).pack(side="right", padx=(0, 6))
 
         actions = ctk.CTkFrame(self)
         actions.pack(fill="x", padx=8, pady=(0, 4))
@@ -1995,6 +2002,156 @@ class AccountsFrame(ctk.CTkFrame):
                 for i in self.tree.get_children()]
         export_rows_to_csv(headers, rows, default_name="accounts_export.csv",
                            parent=self, notify=self.notify or self._feedback)
+
+    # ------------------------------------------------------- bulk upload
+    def bulk_upload(self):
+        """Pick a CSV of student accounts and import it.  Returns the
+        summary dict, or None when cancelled / the file was unusable."""
+        path = filedialog.askopenfilename(
+            title="Import student accounts (CSV)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            parent=self)
+        if not path:
+            return None
+        summary = self.import_accounts_csv(path)
+        if summary is not None:
+            self._show_bulk_summary(summary)
+        return summary
+
+    def import_accounts_csv(self, path):
+        """Import one CSV of student accounts: one header row (export's
+        display names or raw column names both work), then one account
+        per row.  Returns {"added": [student_id, ...], "skipped": [line
+        reasons], "errors": [line reasons]} - or None when the FILE
+        itself is unusable (already reported through _feedback); row
+        problems never abort the run.
+
+        Same write rules as _save_form: role=student, password hashed
+        (blank = the factory default), flagged must_change_password."""
+        try:
+            with open(path, newline="", encoding="utf-8-sig") as fh:
+                rows = list(csv.reader(fh))
+        except Exception as e:
+            self._feedback(f"Could not read the CSV: {e}", "error")
+            return None
+
+        def col(name):
+            key = "_".join("".join(
+                ch if ch.isalnum() else " " for ch in
+                str(name).strip().lower()).split())
+            return {"year": "year_level", "contact_no": "contact"}.get(key, key)
+
+        idx = {}
+        for i, name in enumerate(rows[0] if rows else []):
+            key = col(name)
+            if key in self.BULK_FIELDS and key not in idx:
+                idx[key] = i
+        if "student_id" not in idx or "full_name" not in idx:
+            self._feedback(
+                "The CSV needs a header row with at least Student ID and"
+                " Full Name columns (optional: password, course, year"
+                " level, email, contact, status).", "error")
+            return None
+
+        summary = {"added": [], "skipped": [], "errors": []}
+        seen = set()
+        conn = get_connection()
+        try:
+            for n, row in enumerate(rows[1:], start=2):
+                if not any(str(c).strip() for c in row):
+                    continue                    # blank / spreadsheet filler
+                def cell(key, row=row):         # bound default: this row
+                    i = idx.get(key)
+                    if i is None or i >= len(row):
+                        return ""
+                    return str(row[i]).strip()
+
+                sid, full = cell("student_id"), cell("full_name")
+                if not sid or not full:
+                    missing = " and ".join(
+                        lbl for lbl, ok in (("Student ID", sid),
+                                            ("Full Name", full)) if not ok)
+                    summary["errors"].append(f"Line {n}: missing {missing}")
+                    continue
+                if sid in seen:
+                    summary["skipped"].append(
+                        f"Line {n}: '{sid}' is repeated in this file")
+                    continue
+                seen.add(sid)
+                if conn.execute("SELECT 1 FROM users WHERE student_id=?",
+                                (sid,)).fetchone():
+                    summary["skipped"].append(
+                        f"Line {n}: '{sid}' already exists")
+                    continue
+                status = ("Inactive"
+                          if cell("status").lower() == "inactive"
+                          else "Active")
+                try:
+                    conn.execute(
+                        "INSERT INTO users (student_id, full_name, password,"
+                        " course, year_level, email, contact, status, role,"
+                        " must_change_password) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (sid, full,
+                         hash_password(cell("password")
+                                       or DEFAULT_CLIENT_PASSWORD),
+                         cell("course"), cell("year_level"), cell("email"),
+                         cell("contact"), status, "student", 1))
+                except Exception as e:
+                    summary["errors"].append(f"Line {n}: {e}")
+                    continue
+                summary["added"].append(sid)
+            conn.commit()
+        finally:
+            conn.close()
+        if summary["added"]:
+            self.refresh()
+            self._notify_change("add", {"student_id": summary["added"][0]})
+        return summary
+
+    def _show_bulk_summary(self, summary):
+        """The import report: Successfully Added / Skipped / Errors,
+        plus one detail line per row."""
+        added = summary.get("added") or []
+        skipped = summary.get("skipped") or []
+        errors = summary.get("errors") or []
+        win = ctk.CTkToplevel(self)
+        win.title("Bulk Upload Result")
+        set_app_icon(win)
+        win.configure(fg_color="#f4f6fb")
+        try:
+            win.transient(self.winfo_toplevel())
+        except Exception:
+            pass
+        body = PaddedFrame(win, padding=12)
+        body.pack(fill="both", expand=True)
+        ctk.CTkLabel(body, text="Bulk Upload Summary",
+                  font=FONT_HEADER).pack(anchor="w", pady=(0, 6))
+        counts = ctk.CTkFrame(body, fg_color="transparent")
+        counts.pack(anchor="w", pady=(0, 4))
+        for text, color in ((f"Successfully Added: {len(added)}", SUCCESS),
+                            (f"Skipped: {len(skipped)}", ORANGE),
+                            (f"Errors: {len(errors)}", CRIMSON)):
+            ctk.CTkLabel(counts, text=text, font=FONT_SMALL,
+                      text_color=color).pack(side="left", padx=(0, 14))
+        lines = ([f"ADDED    {v}" for v in added] +
+                 [f"SKIPPED  {v}" for v in skipped] +
+                 [f"ERROR    {v}" for v in errors])
+        if not lines:
+            lines = ["No data rows found in the file."]
+        box = ctk.CTkTextbox(body, width=440, height=190)
+        box.pack(fill="both", expand=True, pady=(8, 0))
+        box.insert("end", "\n".join(lines))
+        box.configure(state="disabled")
+        ctk.CTkButton(body, text="Close",
+                   command=win.destroy).pack(anchor="e", pady=(10, 0))
+        win.bind("<Escape>", lambda _e: win.destroy())
+        try:
+            win.update_idletasks()
+            win.grab_set()
+        except Exception:
+            pass
+        center_window(win, 500, 340)
+        return win
 
     # ----------------------------------------------------- add / edit form
     def open_add(self):

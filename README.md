@@ -188,7 +188,14 @@ managing a school computer laboratory / internet café over a **LAN only**
   Search / Status / Course filters with Clear, and the account table —
   **the password column never appears anywhere**. Row actions are
   *View Details*, *Edit*, *Delete*, *Refresh* and *Export CSV*, plus the
-  accent **+ Add Account** dialog. *View Details* opens an **Account
+  accent **+ Add Account** dialog and **Bulk Upload** — import a CSV of
+  student accounts (header row with at least *Student ID* and *Full
+  Name*; the export's own column names work as-is, one account per
+  row): blank password fields get the factory default like **+ Add
+  Account** does, duplicate Student IDs (in the file or already in the
+  database) are skipped, missing required fields become errors, and a
+  summary dialog reports **Successfully Added / Skipped / Errors** with
+  one detail line per row. *View Details* opens an **Account
   Details** window with four tabs: **Overview**, **Sessions**,
   **Activity Logs** and **PC Usage** (sessions grouped per PC). Add
   saves a salted hash with `role=student` and
