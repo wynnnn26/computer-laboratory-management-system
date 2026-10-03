@@ -45,6 +45,10 @@ class MessageType(Enum):
     CMD_SEND_MESSAGE = "cmd_send_message"
     CMD_EXECUTE = "cmd_execute"
     CMD_WEB_FILTER = "cmd_web_filter"
+    # Single file push (Server -> Client): the client saves the payload on
+    # its Desktop - documents/handouts only, executables are refused on
+    # both ends.  CMD_EXECUTE above stays deliberately unhandled.
+    CMD_SEND_FILE = "cmd_send_file"
     # Remote control (Server -> Client) - Task 5.  These three are the ONLY
     # messages that can ever move the remote machine's mouse or keyboard.
     # CMD_REMOTE_INPUT carries a whitelisted list of input primitives
@@ -82,6 +86,17 @@ class MessageType(Enum):
     # Error
     ERROR = "error"
     PONG = "pong"
+
+
+# --------------------------------------------------------------------------
+# Pushed-file policy (CMD_SEND_FILE): shared by both ends - the Server
+# refuses before the wire, the Client re-refuses even if a rogue Server
+# asks.  Documents/handouts only: these suffixes run or auto-start by
+# double-click, so a pushed file can never be one of them.
+# --------------------------------------------------------------------------
+DENY_FILE_EXTS = (".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js",
+                  ".msi", ".scr", ".lnk")
+MAX_PUSH_FILE_BYTES = 5 * 1024 * 1024
 
 
 # --------------------------------------------------------------------------

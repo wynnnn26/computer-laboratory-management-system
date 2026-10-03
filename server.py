@@ -17,6 +17,7 @@ import sys
 import json
 import ssl
 import time
+import base64
 uuid = __import__("uuid")
 import socket
 import threading
@@ -29,7 +30,7 @@ from utils import now_date, now_time, now_datetime
 from protocol import (
     Message, MessageType, TLSSocketWrapper, create_ssl_context,
     generate_self_signed_cert, DISCOVER_MAGIC, REPLY_MAGIC,
-    discovery_udp_port,
+    discovery_udp_port, DENY_FILE_EXTS, MAX_PUSH_FILE_BYTES,
 )
 
 CLIENT_VERSION = "2.0"
@@ -1359,10 +1360,11 @@ class LabServer:
         "force_unlock": MessageType.CMD_UNLOCK,
         "restart": MessageType.CMD_RESTART,
         "shutdown": MessageType.CMD_SHUTDOWN,
+        "send_file": MessageType.CMD_SEND_FILE,    # payload = filename + data
     }
 
     def bulk_command(self, action, pc_names, admin_user="", params=None,
-                     timeout=None) -> dict:
+                     timeout=None, audit_params=None) -> dict:
         """Run one action across many PCs with an honest per-PC result:
 
             SUCCESS  - the client ACKed the command
@@ -1388,7 +1390,8 @@ class LabServer:
                 try:
                     resp = self.send_command(cmd, pc, dict(params or {}),
                                              admin_user=admin_user,
-                                             wait_response=True, timeout=timeout)
+                                             wait_response=True, timeout=timeout,
+                                             audit_params=audit_params)
                 except Exception as e:
                     resp = {"success": False, "error": str(e)}
                 if resp.get("success"):
@@ -1420,8 +1423,13 @@ class LabServer:
 
     def send_command(self, cmd: MessageType, target_pc: str, params: dict = None,
                      admin_user: str = "", wait_response: bool = True,
-                     timeout: float = None) -> dict:
-        """Send a command to a client and optionally wait for its response."""
+                     timeout: float = None, audit_params: dict = None) -> dict:
+        """Send a command to a client and optionally wait for its response.
+
+        audit_params: what to RECORD about the command when the wire params
+        carry a bulky payload (a pushed file's base64 data) - the audit row
+        and client_commands keep the summary, the wire keeps the bytes.
+        """
         from protocol import build_command
         entry = self.get_client(target_pc)
         if not entry or not entry.is_online:
@@ -1430,17 +1438,18 @@ class LabServer:
         command_id = uuid.uuid4().hex[:8]
         msg = build_command(cmd, target_pc, params or {}, admin_user, command_id)
 
+        rec = json.dumps(audit_params if audit_params is not None
+                         else (params or {}))
         conn = get_connection()
         conn.execute(
             "INSERT INTO client_commands (command_id, target_pc, command_type, params, admin_user, "
             "status, created_at) VALUES (?,?,?,?,?,'Sent',?)",
-            (command_id, target_pc, cmd.value, json.dumps(params or {}), admin_user, now_datetime()),
+            (command_id, target_pc, cmd.value, rec, admin_user, now_datetime()),
         )
         conn.commit()
         conn.close()
 
-        self._log_activity(admin_user, f"command:{cmd.value}", target_pc,
-                           json.dumps(params or {}))
+        self._log_activity(admin_user, f"command:{cmd.value}", target_pc, rec)
 
         if not entry.send(msg):
             return {"success": False, "error": "Send failed", "command_id": command_id}
@@ -1863,6 +1872,50 @@ class LabServer:
         self._audit_done(cid, False, "timeout")
         self._log_activity(admin, "screenshot", pc, "FAILED: timeout")
         return {"success": False, "error": "Screenshot timeout"}
+
+    def push_desktop_file(self, pc_names, path, admin="", role="",
+                          timeout=None) -> dict:
+        """Push one file to every named PC's Desktop (ADMINISTRATOR only).
+
+        Returns bulk_command's honest per-PC dict:
+        SUCCESS / FAILED / OFFLINE / TIMEOUT.  The file is read and
+        encoded once, then sent to each online PC; validation failures
+        never reach the wire.
+        """
+        names = [str(p) for p in (pc_names or [])]
+        if not names:
+            return {}
+
+        def _refused(err):
+            return {pc: {"success": False, "result": "FAILED", "error": err}
+                    for pc in names}
+
+        # ADMINISTRATOR gate, refused AT THE SERVER (the hidden button is
+        # only the convenience layer) - audited as a security event.
+        if not self._observe_role_ok(role, admin, "send_file_refuse", names[0]):
+            return _refused("ADMINISTRATOR only")
+
+        path = str(path or "")
+        if not os.path.isfile(path):
+            return _refused("File not found")
+        if os.path.splitext(path)[1].lower() in DENY_FILE_EXTS:
+            return _refused("Executable file types are not allowed")
+        size = os.path.getsize(path)
+        if size > MAX_PUSH_FILE_BYTES:
+            return _refused("File is too large (limit 5 MB)")
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except Exception as e:
+            return _refused(f"Could not read the file: {e}")
+
+        payload = {"filename": os.path.basename(path),
+                   "data": base64.b64encode(raw).decode("ascii")}
+        # the audit rows record name + size only - never the payload bytes
+        slim = {"filename": payload["filename"], "bytes": size}
+        return self.bulk_command("send_file", names, admin_user=admin,
+                                 params=payload, timeout=timeout or 60,
+                                 audit_params=slim)
 
     # ------------------------------------------- P4: ADMINISTRATOR only
     def _observe_role_ok(self, role, admin, action, pc, once_key=None):

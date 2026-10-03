@@ -79,7 +79,7 @@ decides which one it is; nothing else needs to change.
 | Student UI | `student_dashboard.py` | Announcements / messages / borrowing (:38) |
 | Data bridge | `client_api.py` | Network-first fetches for the student UI with SQLite fallback (:17) |
 | UI framework | `components.py`, `theme.py`, `utils.py`, `crud_frame.py` | Shared widgets, design tokens, styling helpers, reusable CRUD tables/pages |
-| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py` | 507 + 251 + 50 checks, self-contained |
+| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py` | 517 + 252 + 50 checks, self-contained |
 | Build | `build_exe.bat`, `requirements.txt` | PyInstaller onefile builds for both apps |
 | Assets | `assets/`, `pc_icons/`, `app_icon.ico` | Logo, 8 PC status icons, window icon |
 | Design docs | `design-system/lab-management-system/MASTER.md` | Token/component spec behind `theme.py` |
@@ -151,7 +151,7 @@ verification (LAN deployment). Frames are read/written through
 | Auth | `AUTH_REQUEST`, `AUTH_RESPONSE`, `AUTH_CHALLENGE` |
 | First-login change | `PASSWORD_CHANGE_REQUEST`, `PASSWORD_CHANGE_RESPONSE` |
 | Lifecycle | `CLIENT_REGISTER`, `CLIENT_HEARTBEAT`, `CLIENT_STATUS`, `CLIENT_DISCONNECT` |
-| Commands (server→client) | `CMD_LOCK`, `CMD_UNLOCK`, `CMD_LOGOUT`, `CMD_RESTART`, `CMD_SHUTDOWN`, `CMD_PAUSE`, `CMD_RESUME`, `CMD_SCREEN_OBSERVE_START/STOP`, `CMD_SCREENSHOT`, `CMD_SEND_MESSAGE`, `CMD_EXECUTE`, `CMD_WEB_FILTER` |
+| Commands (server→client) | `CMD_LOCK`, `CMD_UNLOCK`, `CMD_LOGOUT`, `CMD_RESTART`, `CMD_SHUTDOWN`, `CMD_PAUSE`, `CMD_RESUME`, `CMD_SCREEN_OBSERVE_START/STOP`, `CMD_SCREENSHOT`, `CMD_SEND_MESSAGE`, `CMD_EXECUTE`, `CMD_WEB_FILTER`, `CMD_SEND_FILE` |
 | Remote input | `CMD_REMOTE_START`, `CMD_REMOTE_STOP`, `CMD_REMOTE_INPUT` (whitelisted primitives only) |
 | Acks | `CMD_RESPONSE`, `WEB_POLICY_ACK`, `PONG` |
 | Sessions / activity | `SESSION_START`, `SESSION_END`, `SESSION_UPDATE`, `ACTIVITY_LOG` |
@@ -417,8 +417,8 @@ exiting non-zero on any failure:
 
 | Suite | Checks | Covers |
 |---|---|---|
-| `_test_integration.py` | **507** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands, dashboard layout, role gating, Accounts bulk CSV upload, guardrails, the standalone uninstaller |
-| `_test_client_gui.py` | **251** | kiosk state machine, lock/pause/logout, command de-dup, offline login + local queue, web policy ack, watchdog, hotkeys, observe clamps |
+| `_test_integration.py` | **517** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands, dashboard layout, role gating, Accounts bulk CSV upload, Send File desktop push, guardrails, the standalone uninstaller |
+| `_test_client_gui.py` | **252** | kiosk state machine, lock/pause/logout, command de-dup, offline login + local queue, web policy ack, watchdog, hotkeys, observe clamps, Send File dispatch |
 | `_probe_layout.py` | **50** | responsive layout at 1080×700 / 1280×780 / 1440×900 |
 
 Test ports: **TCP 18443**, **UDP 18444** (= 18443+1) — never the production

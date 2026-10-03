@@ -39,7 +39,8 @@ managing a school computer laboratory / internet café over a **LAN only**
 - **Roles:** `admin`, `staff`, `maintenance`, `student` (customer).
 - **Remote controls:** lock, unlock (Admin Force Login), logout, pause,
   resume, restart, shutdown, message popup, one-shot screenshot, live
-  screen observation, and `[ 🖱 Remote ]` (mouse + keyboard control) —
+  screen observation, `[ 🖱 Remote ]` (mouse + keyboard control) and
+  `📤 Send File` (push a document to the selected PCs' Desktop) —
   every command is acknowledged and its success/failure is shown as a
   non-blocking toast.
 - **`[ 🖱 Remote ]` remote control:** sits next to the other client
@@ -67,6 +68,17 @@ managing a school computer laboratory / internet café over a **LAN only**
   a machine can always be released and never left under remote control
   by someone who is no longer allowed to hold it.
   `[Observe]` is unchanged and stays view-only.
+- **`[ 📤 Send File ]` pushes one file to the selected PCs' Desktop**:
+  pick the file once and send it to any number of selected PCs (Ctrl+A =
+  every PC); several PCs report through the existing per-PC
+  `SUCCESS / OFFLINE / FAILED` bulk result list, a single PC gets a plain
+  toast. Documents only — `.exe .bat .cmd .ps1 .vbs .js .msi .scr .lnk`
+  are refused at the Server **and** re-refused on the Client, the size is
+  capped at 5 MB, and the filename is reduced to a safe basename with a
+  collision rename (`file (1).ext`). ADMINISTRATOR-only: the button is
+  not even built for other roles and the Server refuses the call as an
+  audited security event. The audit rows record the file name and size,
+  never the payload bytes.
 - **Pause never expires on its own** — it stays active until the admin
   explicitly presses Resume (and survives client/server restarts).
 - **Admin Lock cannot be bypassed by typing credentials**: only an
@@ -566,7 +578,7 @@ and the eight `pc_icons/*.png` status icons.
 ## Tests
 
 ```
-python _test_integration.py   # 486 checks: TLS framing, auth & role claim,
+python _test_integration.py   # 517 checks: TLS framing, auth & role claim,
                               # first-login password change (flagged
                               # accounts, sessions blocked until changed,
                               # hashed storage, audit rows),
@@ -661,7 +673,7 @@ python _test_integration.py   # 486 checks: TLS framing, auth & role claim,
                                # action stays a toast, and an unanswered
                                # disconnect is logged rather than turned
                                # into a power action on its own
-python _test_client_gui.py    # 251 checks: kiosk state machine, admin lock,
+python _test_client_gui.py    # 252 checks: kiosk state machine, admin lock,
                               # force login, pause, logout, command
                               # de-duplication, login card (password
                               # toggle, server line, PC footer),
@@ -815,9 +827,9 @@ lab_system/
 │                         pc_icons/ status icons, --collect-all
 │                         customtkinter for the dark UI; client.exe also
 │                         pulls in the pystray Windows backend)
-├── _test_integration.py  486-check end-to-end suite (server + protocol +
+├── _test_integration.py  517-check end-to-end suite (server + protocol +
 │                         admin dashboard)
-├── _test_client_gui.py   251-check kiosk state-machine suite
+├── _test_client_gui.py   252-check kiosk state-machine suite
 ├── _probe_layout.py      Responsive layout probe (no clipped rows or
 │                         panel overruns at min/default/large sizes)
 ├── server.crt/server.key Auto-generated self-signed TLS certificate

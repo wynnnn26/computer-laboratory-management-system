@@ -1993,6 +1993,88 @@ row = database.get_connection().execute(
 check("resume clears pause state", row and not row["admin_state"],
       str(row and row["admin_state"]))
 
+# ------------------------------------- Send File: admin push to a PC Desktop
+import base64 as _b64
+from protocol import DENY_FILE_EXTS, MAX_PUSH_FILE_BYTES
+from admin_dashboard import audit_action_category, audit_action_label
+check("protocol has CMD_SEND_FILE wired into bulk actions",
+      MessageType.CMD_SEND_FILE.value == "cmd_send_file"
+      and srv.BULK_ACTIONS.get("send_file") == MessageType.CMD_SEND_FILE
+      and all(e in DENY_FILE_EXTS for e in (".exe", ".bat", ".ps1", ".lnk")),
+      str(srv.BULK_ACTIONS.get("send_file")))
+# the client handler writes into a patched Desktop dir - the real one is
+# never touched (module patch; nothing else in this run calls desktop_dir)
+_sf_desk = tempfile.mkdtemp(prefix="sendfile_")
+client_mod.desktop_dir = lambda: _sf_desk
+_sf_hello = _b64.b64encode(b"lab handout").decode("ascii")
+_ok, _det = client_mod.ClientApp._save_desktop_file(
+    None, {"filename": "..\\evil.txt", "data": _sf_hello})
+check("send file lands on the Desktop with a sanitized name",
+      _ok and open(os.path.join(_sf_desk, "evil.txt"), "rb").read()
+      == b"lab handout", str((_ok, _det)))
+_ok, _det = client_mod.ClientApp._save_desktop_file(
+    None, {"filename": "evil.txt", "data": _sf_hello})
+check("send file renames on a collision",
+      _ok and os.path.basename(str(_det)) == "evil (1).txt", str(_det))
+_ok, _det = client_mod.ClientApp._save_desktop_file(
+    None, {"filename": "payload.exe", "data": _sf_hello})
+check("client refuses executable payloads",
+      not _ok and "Executable" in str(_det)
+      and not os.path.exists(os.path.join(_sf_desk, "payload.exe")),
+      str((_ok, _det)))
+# server-side validation refuses BEFORE the wire
+with open(os.path.join(_sf_desk, "payload.exe"), "wb") as fh:
+    fh.write(b"MZ")
+res = srv.push_desktop_file(["TEST-PC"], os.path.join(_sf_desk, "payload.exe"),
+                            admin="tester", role="admin")
+check("server refuses executable files",
+      len(res) == 1 and all(
+          not r.get("success") and "Executable" in str(r.get("error"))
+          for r in res.values()), str(res))
+with open(os.path.join(_sf_desk, "big.pdf"), "wb") as fh:
+    fh.write(b"\0" * (MAX_PUSH_FILE_BYTES + 1))
+res = srv.push_desktop_file(["TEST-PC"], os.path.join(_sf_desk, "big.pdf"),
+                            admin="tester", role="admin")
+check("server refuses oversized files",
+      all(not r.get("success") and "too large" in str(r.get("error"))
+          for r in res.values()),
+      str({k: v.get("error") for k, v in res.items()}))
+with open(os.path.join(_sf_desk, "notes.txt"), "wb") as fh:
+    fh.write(b"note")
+res = srv.push_desktop_file(["TEST-PC"], os.path.join(_sf_desk, "notes.txt"),
+                            admin="tester", role="staff")
+check("non-admin send refused at the server",
+      all(not r.get("success") and "ADMINISTRATOR" in str(r.get("error"))
+          for r in res.values()), str(res))
+# live wire: TEST-PC acks the command (SUCCESS), GONE-PC never gets one
+res = srv.push_desktop_file(["TEST-PC", "GONE-PC"],
+                            os.path.join(_sf_desk, "notes.txt"),
+                            admin="tester", role="admin")
+check("bulk push reports one honest result per PC",
+      res.get("TEST-PC", {}).get("success") is True
+      and res.get("TEST-PC", {}).get("result") == "SUCCESS"
+      and res.get("GONE-PC", {}).get("result") == "OFFLINE", str(res))
+conn = database.get_connection()
+row = conn.execute("SELECT params FROM client_commands "
+                   "WHERE command_type='cmd_send_file' "
+                   "ORDER BY id DESC LIMIT 1").fetchone()
+n_bulk = conn.execute("SELECT COUNT(*) c FROM admin_activity_log "
+                      "WHERE action='BULK_SEND_FILE'").fetchone()["c"]
+n_refuse = conn.execute("SELECT COUNT(*) c FROM admin_activity_log "
+                        "WHERE action='send_file_refuse'").fetchone()["c"]
+n_cmd = conn.execute("SELECT COUNT(*) c FROM admin_activity_log "
+                     "WHERE action='command:cmd_send_file'").fetchone()["c"]
+conn.close()
+check("send-file audits are summaries (no payload bytes) and categorized",
+      row and len(row["params"]) < 500 and "notes.txt" in row["params"]
+      and n_bulk >= 1 and n_refuse >= 1 and n_cmd >= 1
+      and audit_action_category("BULK_SEND_FILE") == "Admin Commands"
+      and audit_action_category("command:cmd_send_file") == "Admin Commands"
+      and audit_action_category("send_file_refuse") == "Security"
+      and audit_action_label("send_file_refuse") == "Send File Refused",
+      f"params_len={row and len(row['params'])} BULK={n_bulk} "
+      f"refuse={n_refuse} cmd={n_cmd}")
+
 # shutdown audit: command + explicit result in the activity log
 res = srv.shutdown_client("TEST-PC", admin="boss")
 check("shutdown command acked", res.get("success") is True, str(res))
@@ -3616,6 +3698,11 @@ _rb = getattr(dash, "_remote_btn", None)
 check("remote button sits with the PC controls",
       _rb is not None and "Remote" in str(_rb.cget("text"))
       and _rb in dash._ctrl_btns,
+      str([str(b.cget("text")) for b in dash._ctrl_btns]))
+check("send file button sits with the PC controls",
+      any("Send File" in str(b.cget("text")) for b in dash._ctrl_btns)
+      and str([str(b.cget("text")) for b in dash._ctrl_btns
+               if "Send File" in str(b.cget("text"))][0]).endswith("Send File"),
       str([str(b.cget("text")) for b in dash._ctrl_btns]))
 _sel_pc = (dash._selected_pcs or [None])[0]
 check("remote button state follows the selected PC's online state",

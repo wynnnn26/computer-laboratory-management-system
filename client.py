@@ -59,6 +59,7 @@ from protocol import (
     build_activity_log, build_error, build_password_change,
     build_web_policy_ack, sanitize_remote_events,
     DISCOVER_MAGIC, REPLY_MAGIC, discovery_udp_port,
+    DENY_FILE_EXTS, MAX_PUSH_FILE_BYTES,
 )
 import customtkinter as ctk
 from components import PaddedFrame, eye_icon, image_master
@@ -261,6 +262,14 @@ def capture_screen_b64(quality: int = 50, scale: float = 0.5) -> str:
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=max(10, min(95, quality)))
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+# ==========================================================================
+# Desktop file delivery (admin "Send File" command)
+# ==========================================================================
+def desktop_dir() -> str:
+    """The logged-in user's Desktop folder (tests monkeypatch this)."""
+    return os.path.join(os.path.expanduser("~"), "Desktop")
 
 
 # ==========================================================================
@@ -2470,6 +2479,49 @@ class ClientApp(ctk.CTk):
         if command_id:
             self.net.send(build_command_response(command_id, success, result, error))
 
+    def _save_desktop_file(self, data) -> tuple:
+        """CMD_SEND_FILE: write the payload onto this PC's Desktop.
+
+        Documents-only (an executable is refused here even if a rogue
+        server asks), size-capped, filename reduced to a safe basename
+        with collision rename - touches nothing outside the Desktop dir.
+        Returns (ok, detail): the saved path or a refusal reason.
+        """
+        raw_name = str((data or {}).get("filename") or "")
+        # basename first (any traversal component is dropped), then strip
+        # characters Windows forbids in file names.
+        name = os.path.basename(raw_name.replace("\\", "/"))
+        name = "".join(ch for ch in name
+                       if ch not in '<>:"/\\|?*' and ch.isprintable()).strip()
+        if not name or name in (".", ".."):
+            return False, "Invalid filename"
+        if os.path.splitext(name)[1].lower() in DENY_FILE_EXTS:
+            return False, "Executable file types are not allowed"
+        try:
+            raw = base64.b64decode(str((data or {}).get("data") or ""),
+                                   validate=True)
+        except Exception:
+            return False, "File data could not be decoded"
+        if len(raw) > MAX_PUSH_FILE_BYTES:
+            return False, "File is too large (limit 5 MB)"
+        dest_dir = desktop_dir()
+        if not os.path.isdir(dest_dir):
+            return False, "Desktop folder not found"
+        stem, ext = os.path.splitext(name)
+        dest = os.path.join(dest_dir, name)
+        n = 0
+        while os.path.exists(dest):
+            n += 1
+            if n > 99:
+                return False, "Too many files with this name on the Desktop"
+            dest = os.path.join(dest_dir, f"{stem} ({n}){ext}")
+        try:
+            with open(dest, "wb") as fh:
+                fh.write(raw)
+        except Exception as e:
+            return False, f"Could not write the file: {e}"
+        return True, dest
+
     # -------------------------------------------------- remote commands
     def handle_command(self, msg: Message):
         """Execute a server command and ALWAYS acknowledge it (Phase F/#7).
@@ -2569,6 +2621,16 @@ class ClientApp(ctk.CTk):
             mtype = data.get("msg_type", "admin")
             self._show_popup(text, mtype)
             self._send_cmd_response(cid, True)
+
+        elif t == MessageType.CMD_SEND_FILE.value:
+            ok, detail = self._save_desktop_file(p.get("params", p))
+            local_store.log_event(
+                "INFO" if ok else "WARNING", "remote",
+                "File saved to Desktop" if ok else "File save refused",
+                str(detail))
+            self._send_cmd_response(cid, ok,
+                                    result=str(detail) if ok else None,
+                                    error=None if ok else str(detail))
 
         elif t == MessageType.CMD_SCREENSHOT.value:
             try:

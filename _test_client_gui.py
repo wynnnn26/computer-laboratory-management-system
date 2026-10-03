@@ -831,6 +831,32 @@ app.handle_command(Message.create(MessageType.CMD_SEND_MESSAGE,
 app.update(); app.update()
 check("[config] message popup handled", app.state == "login")
 
+# --- Send File: dispatch writes to a patched Desktop and acks success ----
+import tempfile as _tf
+_desk = _tf.mkdtemp(prefix="cdesk_")
+_orig_dd = client.desktop_dir
+client.desktop_dir = lambda: _desk
+_acks = []
+_orig_s = app.net.send
+def _cap_ack2(msg):
+    if msg.type == MessageType.CMD_RESPONSE.value:
+        _acks.append(msg)
+    return True
+app.net.send = _cap_ack2
+app.handle_command(Message.create(MessageType.CMD_SEND_FILE,
+                                  {"params": {"filename": "notes.txt",
+                                              "data": "aGVsbG8="},
+                                   "command_id": "sf1"}))
+app.net.send = _orig_s
+client.desktop_dir = _orig_dd
+check("[sendfile] dispatch saves the file and acks success",
+      os.path.isfile(os.path.join(_desk, "notes.txt"))
+      and open(os.path.join(_desk, "notes.txt"), "rb").read() == b"hello"
+      and _acks and _acks[0].payload.get("success") is True
+      and _acks[0].payload.get("command_id") == "sf1",
+      str([(a.payload.get("command_id"), a.payload.get("success"))
+           for a in _acks]))
+
 # --- command_id de-duplication: a re-delivered command runs ONCE ---------
 acks = []
 orig_send2 = app.net.send

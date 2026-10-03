@@ -17,13 +17,14 @@ UI rules (v2.1):
   * every page auto-refreshes (no manual refresh required).
 """
 
+import os
 import io
 import time
 import base64
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from tkinter import font as tkfont
 
 from database import get_connection
@@ -63,7 +64,10 @@ AUDIT_TAXONOMY = {
          # P4: a batch that would have driven a PC for someone who is not
          # an administrator - refused, and kept as the security event it is
          # rather than as a piece of monitoring.
-         "remote_input_reject"},
+         "remote_input_reject",
+         # an attempt to push a file to a lab PC that the Server refused
+         # (non-administrator role) - same reasoning as above.
+         "send_file_refuse"},
         ()),
     "Website Access": (
         {"web_access_detected", "web_access_unresolved",
@@ -106,6 +110,7 @@ AUDIT_LABELS = {
     "remote_control_start": "Remote Control Start",
     "remote_control_stop": "Remote Control Stop",
     "remote_input_reject": "Remote Input Refused",
+    "send_file_refuse": "Send File Refused",
     "web_access_detected": "Website Access Detected",
     "web_access_unresolved": "Website Access Unresolved",
     "web_browser_closed": "Browser Closed (Website Access)",
@@ -1475,6 +1480,9 @@ class AdminDashboard(ctk.CTkToplevel):
             # the only control that forwards input, and only while a PC is
             # selected AND online (see _update_selection_ui).
             ("\U0001f5b1 Remote", self._remote, "#a33b00"),
+            # one file, picked once, pushed to every selected PC's Desktop
+            # (documents only - executables are refused at the Server).
+            ("\U0001f4e4 Send File", self._send_file, "#0f766e"),
         ]
         if not self.is_admin:
             # P4: watching or driving a machine is ADMINISTRATOR-only, so
@@ -1483,7 +1491,8 @@ class AdminDashboard(ctk.CTkToplevel):
             # non-admin role, so hiding the buttons is defence in depth
             # rather than the access control itself.
             controls = [c for c in controls
-                        if not c[0].endswith(("Observe", "Remote"))]
+                        if not c[0].endswith(("Observe", "Remote",
+                                              "Send File"))]
         for i, (text, cmd, color) in enumerate(controls):
             r, c = divmod(i, 5)
             b = ctk.CTkButton(btns, text=text, command=cmd, fg_color=color, text_color="white",
@@ -1497,8 +1506,10 @@ class AdminDashboard(ctk.CTkToplevel):
             btns.columnconfigure(c, weight=1)
 
         # ---- inline message row (no dialogs for normal events) ----
+        # row 3: the control grid now has 3 rows of buttons (11 for an
+        # administrator), so the message row sits underneath, never on top.
         msg_row = ctk.CTkFrame(btns, fg_color=BG_LIGHT)
-        msg_row.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(5, 0))
+        msg_row.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(5, 0))
         msg_row.columnconfigure(1, weight=1)
         ctk.CTkLabel(msg_row, text="Message to selected PC:",
                  font=("Segoe UI", 9, "bold"), fg_color=BG_LIGHT).grid(
@@ -2317,6 +2328,43 @@ class AdminDashboard(ctk.CTkToplevel):
         threading.Thread(target=worker, daemon=True).start()
         self.client_status_lbl.configure(text=f"Requesting screenshot from {pc}…",
                                       text_color=SUBTLE)
+
+    def _send_file(self):
+        """Push the picked file to the Desktop of every selected PC."""
+        if not self.server:
+            self.toast("Server not connected.", "warn")
+            return
+        names = [str(p) for p in (self._selected_pcs or [])]
+        if not names:
+            self.toast("Select at least one PC first.", "warn")
+            return
+        path = filedialog.askopenfilename(
+            title=("Send file to " + names[0] if len(names) == 1
+                   else f"Send file to {len(names)} PCs"),
+            parent=self)
+        if not path:
+            return
+
+        def worker():
+            try:
+                res = self.server.push_desktop_file(
+                    names, path, admin=self._admin_name(),
+                    role=self.role_name)
+            except Exception as e:
+                res = {n: {"success": False, "result": "FAILED",
+                           "error": str(e)} for n in names}
+            # one PC: a plain toast; several: the existing per-PC
+            # SUCCESS / OFFLINE / FAILED result list.
+            if len(names) == 1:
+                self.results.put(("Send File", names[0],
+                                  res.get(names[0]) or
+                                  {"success": False, "error": "failed"}))
+            else:
+                self.results.put(("bulk", "send_file", res))
+
+        threading.Thread(target=worker, daemon=True, name="sendfile").start()
+        self._set_status_text(
+            f"SEND FILE → {len(names)} PC(s) …", SUBTLE)
 
     def _observe(self):
         pc = self._selected_pc()
