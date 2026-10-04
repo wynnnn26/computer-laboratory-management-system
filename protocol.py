@@ -41,6 +41,14 @@ class MessageType(Enum):
     CMD_RESUME = "cmd_resume"
     CMD_SCREEN_OBSERVE_START = "cmd_screen_observe_start"
     CMD_SCREEN_OBSERVE_STOP = "cmd_screen_observe_stop"
+    # Screen share (Server -> Client): the Server machine's own screen
+    # pushed to lab PCs for teaching (slides, live coding).  Display-only
+    # by construction - the frame payload is a base64 JPEG string with
+    # nothing the Client could execute, and frames deliberately never
+    # carry a command_id (no ack, no audit row per frame).
+    CMD_SCREEN_SHARE_START = "cmd_screen_share_start"
+    CMD_SCREEN_SHARE_FRAME = "cmd_screen_share_frame"
+    CMD_SCREEN_SHARE_STOP = "cmd_screen_share_stop"
     CMD_SCREENSHOT = "cmd_screenshot"
     CMD_SEND_MESSAGE = "cmd_send_message"
     CMD_EXECUTE = "cmd_execute"
@@ -494,6 +502,30 @@ def build_screen_observe_start(interval: float = 1.0, quality: int = 50, scale: 
 
 def build_screen_observe_stop() -> Message:
     return Message.create(MessageType.CMD_SCREEN_OBSERVE_STOP, {})
+
+
+# ------------------------------------------------------------- screen share
+#: hard ceiling on ONE pushed share frame (base64 chars); a full-HD JPEG
+#: at quality 85 stays far below it, anything bigger is a corrupted or
+#: hostile payload and is dropped by the Client before decoding.
+MAX_SHARE_FRAME_CHARS = 12 * 1024 * 1024
+
+
+def build_screen_share_start(admin: str = "") -> Message:
+    return Message.create(MessageType.CMD_SCREEN_SHARE_START, {
+        "admin": admin
+    })
+
+
+def build_screen_share_frame(image_b64: str, seq: int = 0) -> Message:
+    return Message.create(MessageType.CMD_SCREEN_SHARE_FRAME, {
+        "image": image_b64,
+        "seq": seq
+    })
+
+
+def build_screen_share_stop() -> Message:
+    return Message.create(MessageType.CMD_SCREEN_SHARE_STOP, {})
 
 
 # --------------------------------------------------------------- remote I/O

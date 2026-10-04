@@ -68,6 +68,22 @@ managing a school computer laboratory / internet café over a **LAN only**
   a machine can always be released and never left under remote control
   by someone who is no longer allowed to hold it.
   `[Observe]` is unchanged and stays view-only.
+- **`📺 Share Screen` pushes the Server machine's own screen to every
+  online lab PC** — the teaching mode: PowerPoint, slides and live
+  coding fill each lab monitor full-screen, borderless and topmost,
+  letterboxed to the display. The Server captures its own screen
+  (scale 0.75, JPEG quality 85 at 4:4:4 chroma so small text stays
+  readable) and fans each frame out to every online PC about five
+  times a second; a PC whose send fails is dropped from the fan-out
+  instead of stalling the class, and the STOP is delivered after the
+  last frame on the same socket (TCP order), so no late frame can
+  reopen a closed overlay. Each Client closes its overlay on STOP,
+  after a 5-second frame timeout, on disconnect and on panic stop.
+  It is **ADMINISTRATOR-only AT THE SERVER** (the same
+  `_observe_role_ok` gate as Observe/Remote), the start/stop is
+  audited per PC with the usual Sent → Done acknowledgement, and it
+  toggles from the Client PCs toolbar (`📺 Share Screen` ⇄
+  `⏹ Stop Sharing`) next to *Send to All*.
 - **`[ 📤 Send File ]` pushes one file to the selected PCs' Desktop**:
   pick the file once and send it to any number of selected PCs (Ctrl+A =
   every PC); several PCs report through the existing per-PC
@@ -582,7 +598,7 @@ and the eight `pc_icons/*.png` status icons.
 ## Tests
 
 ```
-python _test_integration.py   # 529 checks: TLS framing, auth & role claim,
+python _test_integration.py   # 548 checks: TLS framing, auth & role claim,
                               # first-login password change (flagged
                               # accounts, sessions blocked until changed,
                               # hashed storage, audit rows),
@@ -661,6 +677,15 @@ python _test_integration.py   # 529 checks: TLS framing, auth & role claim,
                                # missing task = done, verify-after stop,
                                # FAILED never self-deletes, a failed export
                                # keeps the audit database),
+                               # Screen share (Server screen -> every
+                               # online lab PC: ADMINISTRATOR-only at
+                               # the server, a dead PC dropped after one
+                               # failed send without stalling the rest,
+                               # real JPEG frames on the wire, audited +
+                               # ack-resolved START and STOP, a second
+                               # start/stop is a no-op, a refused role
+                               # and an all-offline roster refuse
+                               # cleanly),
                                # and the P1.5 safety sign-off - 11
                                # guardrail checks that fail the gate if
                                # any non-negotiable erodes: no hardware/
@@ -686,7 +711,7 @@ python _test_integration.py   # 529 checks: TLS framing, auth & role claim,
                                # action stays a toast, and an unanswered
                                # disconnect is logged rather than turned
                                # into a power action on its own
-python _test_client_gui.py    # 252 checks: kiosk state machine, admin lock,
+python _test_client_gui.py    # 262 checks: kiosk state machine, admin lock,
                               # force login, pause, logout, command
                               # de-duplication, login card (password
                               # toggle, server line, PC footer),
@@ -722,6 +747,11 @@ python _test_client_gui.py    # 252 checks: kiosk state machine, admin lock,
                               # UNRESOLVED and refused closes are reported
                               # instead of swallowed, and a real detector
                               # event never terminates a non-browser
+                              # [share] the fullscreen overlay opens on
+                              # START, paints a frame, drops an oversized
+                              # payload without decoding, reopens for a
+                              # mid-share rejoin, closes on STOP and
+                              # times out once frames stop for 5 s
 python _probe_layout.py       # 50 checks: responsive layout probe -
                               # measures the Dashboard + Client PCs pages,
                               # the right-side details panel and the sidebar
@@ -752,14 +782,20 @@ lab_system/
 │                         (derive_status) + bulk commands with per-PC
 │                         results and BULK_* audits, web policy push /
 │                         per-PC version acks (SYNCED only on ack),
-│                         STU branches (auth_roster, log_sync, ...)
+│                         STU branches (auth_roster, log_sync, ...),
+│                         screen-share capture→fan-out worker (a dead
+│                         PC dropped after one failed send, STOP sent
+│                         after the last frame)
 ├── client.py             ClientApp: fullscreen kiosk login, heartbeats,
 │                         auto-reconnect/re-register, remote-command
 │                         execution (ACKed, de-duplicated by command id),
-│                         screen capture, keyboard-hook
+│                         screen capture, share-screen fullscreen
+│                         overlay (closed on STOP / 5 s frame timeout /
+│                         disconnect), keyboard-hook
 │                         bypass protection, session bar, offline
 │                         login + local event log (queue/flush)
-├── protocol.py           Message types, heartbeat ACK (PONG), TLS helpers,
+├── protocol.py           Message types (commands incl. screen share),
+│                         heartbeat ACK (PONG), TLS helpers,
 │                         frame encode/decode
 ├── client_api.py         Network-first data bridge used by the student
 │                         dashboard (local-SQLite fallback preserved)
@@ -794,7 +830,8 @@ lab_system/
 │                         Search PCs toolbar, status filter chips with
 │                         live counts, PC card grid, compact bulk
 │                         toolbar & right-side PC details panel;
-│                         Client PCs with remote controls, screen viewer
+│                         Client PCs with remote controls, Share Screen
+│                         toggle, screen viewer
 │                         & right-side details; simplified Computer
 │                         management, Accounts (cards + Account Details
 │                         window), Staff & Admin (same CRUD and the same
@@ -840,9 +877,9 @@ lab_system/
 │                         pc_icons/ status icons, --collect-all
 │                         customtkinter for the dark UI; client.exe also
 │                         pulls in the pystray Windows backend)
-├── _test_integration.py  529-check end-to-end suite (server + protocol +
+├── _test_integration.py  548-check end-to-end suite (server + protocol +
 │                         admin dashboard)
-├── _test_client_gui.py   252-check kiosk state-machine suite
+├── _test_client_gui.py   262-check kiosk state-machine suite
 ├── _probe_layout.py      Responsive layout probe (no clipped rows or
 │                         panel overruns at min/default/large sizes)
 ├── server.crt/server.key Auto-generated self-signed TLS certificate

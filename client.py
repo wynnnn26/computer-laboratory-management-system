@@ -41,7 +41,8 @@ from database import get_setting, get_connection, DEFAULT_CLIENT_PASSWORD  # noq
 from utils import (style_app, center_window, FONT_TITLE, FONT_LABEL,
                    FONT_HEADER, set_app_icon, get_logo, BG_DARK, ACCENT,
                    DANGER, WARN, ONLINE, CARD, CARD_ALT, BORDER, TEXT,
-                   SUBTLE)
+                   SUBTLE,
+                   capture_screen_b64)   # shared with the Server's share
 import client_api
 import local_store          # durable local logs + offline auth roster
 try:
@@ -59,7 +60,7 @@ from protocol import (
     build_activity_log, build_error, build_password_change,
     build_web_policy_ack, sanitize_remote_events,
     DISCOVER_MAGIC, REPLY_MAGIC, discovery_udp_port,
-    DENY_FILE_EXTS, MAX_PUSH_FILE_BYTES,
+    DENY_FILE_EXTS, MAX_PUSH_FILE_BYTES, MAX_SHARE_FRAME_CHARS,
 )
 import customtkinter as ctk
 from components import PaddedFrame, eye_icon, image_master
@@ -249,19 +250,9 @@ def snapshot_metrics() -> tuple:
 
 
 # ==========================================================================
-# Screen capture (screenshot / live observation)
+# Screen capture (screenshot / live observation) now lives in utils.py -
+# capture_screen_b64() is shared with the Server's teaching screen share.
 # ==========================================================================
-def capture_screen_b64(quality: int = 50, scale: float = 0.5) -> str:
-    import PIL.Image as PILImage
-    from PIL import ImageGrab
-    img = ImageGrab.grab()
-    if scale and scale != 1.0:
-        w, h = int(img.width * scale), int(img.height * scale)
-        resample = getattr(PILImage, "Resampling", PILImage)
-        img = img.resize((w, h), resample.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=max(10, min(95, quality)))
-    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 # ==========================================================================
@@ -2401,6 +2392,7 @@ class ClientApp(ctk.CTk):
                 action="panic_stop", target=self.net.pc_name,
                 details="Ctrl+Shift+Alt+K - session stopped and PC locked"))
         self.stop_observation()      # never keep streaming after a panic
+        self._share_close("panic stop")   # never cover the PC after a panic
         self._remote_stop_now("panic stop")   # never stay under remote control
         self.user_logout("Panic stop (Ctrl+Shift+Alt+K)")
         return "break"
@@ -2655,6 +2647,22 @@ class ClientApp(ctk.CTk):
             self.stop_observation()
             self._send_cmd_response(cid, True, result="stopped")
 
+        elif t == MessageType.CMD_SCREEN_SHARE_START.value:
+            # Teaching share: flip the PC to "presentation mode" NOW, so
+            # the screen goes black-with-overlay before the first frame
+            # lands a beat later.  Acked per PC, exactly like Observe.
+            if self._share_open(str(p.get("admin") or "-")):
+                self._send_cmd_response(cid, True, result="sharing")
+            else:
+                self._send_cmd_response(cid, False, error="overlay failed")
+
+        elif t == MessageType.CMD_SCREEN_SHARE_STOP.value:
+            # The Server's worker sends this after its last frame on the
+            # same socket, so no frame can arrive late and reopen the
+            # overlay it just closed.
+            self._share_close("stopped by admin")
+            self._send_cmd_response(cid, True, result="share_stopped")
+
         elif t == MessageType.CMD_REMOTE_START.value:
             # Task 5: the ONE thing that opens the input gate.  It can only
             # arrive from the Server's authenticated command channel (an
@@ -2837,6 +2845,117 @@ class ClientApp(ctk.CTk):
             return
         stop.set()
         local_store.log_event("INFO", "observe", "Screen observation stopped")
+
+    # ------------------------------------------------ screen share (client)
+    def _share_open(self, admin="-"):
+        """Show the fullscreen overlay that carries the shared screen.
+
+        Borderless, topmost, covering the whole display: during a share
+        the lab PC IS the classroom screen.  Idempotent - a repeat START
+        or the first frame after a mid-share rejoin never stacks a second
+        window - and safe off the Tk thread's perspective because every
+        caller (handle_command / the event pump) already runs on it.
+        """
+        win = getattr(self, "_share_win", None)
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    self._share_last = time.time()
+                    return True
+            except Exception:
+                pass
+            self._share_win = None
+        try:
+            win = ctk.CTkToplevel(self)
+            win.overrideredirect(True)
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+            win.geometry(f"{win.winfo_screenwidth()}x"
+                         f"{win.winfo_screenheight()}+0+0")
+            lbl = ctk.CTkLabel(win, text="Waiting for the shared screen…",
+                               fg_color="#000000", text_color="#ffffff",
+                               font=("Segoe UI", 16))
+            lbl.pack(fill="both", expand=True)
+            win.label = lbl
+            self._share_win = win
+            self._share_last = time.time()
+            win.after(1000, self._share_tick)
+            local_store.log_event(
+                "INFO", "share", "Screen share shown",
+                f"admin={admin or '-'} "
+                f"link={'up' if self.net.connected else 'down'}")
+            return True
+        except Exception:
+            self._share_win = None
+            local_store.log_event("ERROR", "share",
+                                  "Screen share overlay failed",
+                                  traceback.format_exc(limit=3))
+            return False
+
+    def _share_frame(self, p):
+        """Decode ONE pushed frame into the overlay.
+
+        Runs from the event pump (never through handle_command, so no
+        per-frame log/ack).  Garbage or oversized payloads are dropped
+        before any decode, and a frame with no overlay reopens it - a PC
+        that reconnects mid-share catches up on the very next frame.
+        """
+        img_b64 = p.get("image") if isinstance(p, dict) else None
+        if not isinstance(img_b64, str) or not img_b64:
+            return
+        if len(img_b64) > MAX_SHARE_FRAME_CHARS:
+            return                      # hostile/Corrupt: never decode it
+        if not self._share_open():
+            return
+        from PIL import Image, ImageTk
+        raw = base64.b64decode(img_b64)
+        img = Image.open(io.BytesIO(raw))
+        img.load()                      # decode now - a bad frame fails HERE
+        win = self._share_win
+        # Letterbox: fit to the display while keeping the aspect ratio, so
+        # a slide or code window is never stretched out of shape.
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        if img.width > sw or img.height > sh:
+            resample = getattr(Image, "Resampling", Image)
+            img.thumbnail((sw, sh), resample.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        win.label.configure(image=photo, text="")
+        win.label.image = photo          # keep a reference
+        self._share_last = time.time()
+
+    def _share_close(self, reason="stopped"):
+        """Close the overlay.  Idempotent; silent when nothing was open
+        (disconnects and panics must not write a share row for PCs that
+        were never shared to)."""
+        win = getattr(self, "_share_win", None)
+        self._share_win = None
+        if win is None:
+            return
+        try:
+            if win.winfo_exists():
+                win.destroy()
+        except Exception:
+            pass
+        local_store.log_event("INFO", "share", "Screen share closed",
+                              f"reason={reason}")
+
+    def _share_tick(self):
+        """1 s heartbeat: close the overlay when frames stop for 5 s, so a
+        crashed Server or half-open socket can never freeze a stale slide
+        on the lab PC forever."""
+        win = getattr(self, "_share_win", None)
+        if win is None or not win.winfo_exists():
+            self._share_win = None
+            return
+        if time.time() - getattr(self, "_share_last", 0) > 5.0:
+            self._share_close("frames stopped")
+        else:
+            try:
+                win.after(1000, self._share_tick)
+            except Exception:
+                self._share_win = None
 
     # -------------------------------------------- remote control (Task 5)
     def _remote_stop_now(self, reason="", session=None, audit=True):
@@ -3169,6 +3288,10 @@ class ClientApp(ctk.CTk):
                 self.user_logout("Connection to server lost")
             self._close_dashboard()
             self.stop_observation()
+            # Screen share dies with the link: a frozen slide must never
+            # sit on the PC after the Server is gone (the 5 s frame
+            # timeout is only the backstop for a half-open socket).
+            self._share_close("connection lost")
             # Task 5: a lost link ends the remote session on the spot -
             # input can never be applied while the server cannot see us,
             # and a later reconnect starts from a clean, closed session.
@@ -3206,6 +3329,17 @@ class ClientApp(ctk.CTk):
                 except Exception:
                     local_store.log_event(
                         "ERROR", "remote", "Remote input batch failed",
+                        traceback.format_exc(limit=3))
+            elif msg.type == MessageType.CMD_SCREEN_SHARE_FRAME.value:
+                # Same rationale as remote input: one message every 200 ms
+                # is screen CONTENT, not an auditable command - routing it
+                # through handle_command would write a local log row (and
+                # expect an ack) per frame.  Display-only, never acked.
+                try:
+                    self._share_frame(msg.payload)
+                except Exception:
+                    local_store.log_event(
+                        "ERROR", "share", "Screen share frame failed",
                         traceback.format_exc(limit=3))
             else:
                 try:

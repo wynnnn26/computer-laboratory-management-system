@@ -78,7 +78,8 @@ AUDIT_TAXONOMY = {
         ("command:cmd_restart", "command:cmd_shutdown")),
     "Monitoring": (
         {"screenshot", "screen_observe_start", "screen_observe_stop",
-         "remote_control_start", "remote_control_stop"},
+         "remote_control_start", "remote_control_stop",
+         "screen_share_start", "screen_share_stop"},
         ()),
     "Admin Commands": (
         set(), ("command:", "BULK_")),
@@ -107,6 +108,8 @@ AUDIT_LABELS = {
     "screenshot": "Screenshot Captured",
     "screen_observe_start": "Screen Observe Start",
     "screen_observe_stop": "Screen Observe Stop",
+    "screen_share_start": "Screen Share Start",
+    "screen_share_stop": "Screen Share Stop",
     "remote_control_start": "Remote Control Start",
     "remote_control_stop": "Remote Control Stop",
     "remote_input_reject": "Remote Input Refused",
@@ -1409,6 +1412,14 @@ class AdminDashboard(ctk.CTkToplevel):
                   fg_color=ACCENT, text_color="white", 
                   font=("Segoe UI", 9, "bold"), cursor="hand2",
                   ).pack(side="right", padx=(4, 6))
+        # Teaching share: THIS machine's screen pushed to every online lab
+        # PC (PowerPoint, live coding).  Toggles in place so the operator
+        # can always see whether the class is currently being shared to.
+        self.share_btn = ctk.CTkButton(
+            bar, text="📺 Share Screen", command=self._toggle_share,
+            fg_color=ACCENT, text_color="white",
+            font=("Segoe UI", 9, "bold"), cursor="hand2")
+        self.share_btn.pack(side="right", padx=(4, 0))
 
         # ---- selection row (Ctrl+A / Select All / Clear / counter) ----
         sel_row = ctk.CTkFrame(page, fg_color=BG_LIGHT)
@@ -2315,6 +2326,38 @@ class AdminDashboard(ctk.CTkToplevel):
         threading.Thread(target=worker, daemon=True).start()
         self.broadcast_var.set("")
         self.client_status_lbl.configure(text="Broadcasting…", text_color=SUBTLE)
+
+    def _toggle_share(self):
+        """Start/stop the teaching screen share (Server screen -> all PCs).
+
+        Synchronous on the Tk thread, exactly like `_observe` - the calls
+        only send small START/STOP messages (the heavy frame fan-out runs
+        on the Server's own worker thread).
+        """
+        if self.server.share_stop is not None:
+            resp = self.server.stop_screen_share(self._admin_name(),
+                                                 role=self.role_name)
+        else:
+            resp = self.server.start_screen_share(self._admin_name(),
+                                                  role=self.role_name)
+        if not resp.get("success"):
+            self.toast(resp.get("error") or "Screen share failed.", "error")
+            return
+        sharing = self.server.share_stop is not None
+        self.share_btn.configure(
+            text="⏹ Stop Sharing" if sharing else "📺 Share Screen",
+            fg_color=DANGER if sharing else ACCENT)
+        if resp.get("already") or resp.get("not_sharing"):
+            return                      # state merely re-synced; no news
+        if sharing:
+            n = len(resp.get("pcs") or [])
+            self.client_status_lbl.configure(
+                text=f"Sharing screen → {n} PCs", text_color=SKY)
+            self.toast(f"Sharing your screen to {n} PC(s)", "success")
+        else:
+            self.client_status_lbl.configure(
+                text="Screen share stopped", text_color=SUBTLE)
+            self.toast("Screen share stopped", "info")
 
     def _screenshot(self):
         pc = self._selected_pc()

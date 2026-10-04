@@ -1514,6 +1514,65 @@ check("[observe] no visible client widget warns about being observed",
       "OBSERVING" not in _texts and "being viewed" not in _texts,
       _texts[:200])
 
+# --- Screen share: a fullscreen classroom overlay that is always closable --
+import io as _shio, base64 as _shb64
+from protocol import MAX_SHARE_FRAME_CHARS as _SHMAX
+app2.net.connected = False            # never send over the test's stub net
+check("[share] nothing is on screen before the command",
+      getattr(app2, "_share_win", None) is None)
+app2.handle_command(Message.create(MessageType.CMD_SCREEN_SHARE_START,
+                                   {"command_id": "sh1", "admin": "tester"}))
+app2.update()
+_shw = getattr(app2, "_share_win", None)
+check("[share] START opens a fullscreen, borderless overlay",
+      _alive(_shw) and bool(_shw.overrideredirect())
+      and str(_shw.winfo_geometry()).startswith(
+          f"{_shw.winfo_screenwidth()}x{_shw.winfo_screenheight()}"),
+      str(_shw.winfo_geometry()) if _alive(_shw) else "no window")
+check("[share] the start lands in the durable local store",
+      any(e.get("message") == "Screen share shown"
+          for e in _ls.pending_logs(500)))
+# a frame built HERE (not captured) so the check never depends on what
+# happens to be on this machine's desktop
+_shb = _shio.BytesIO()
+from PIL import Image as _ShImage
+_ShImage.new("RGB", (320, 180), (200, 30, 30)).save(_shb, "JPEG")
+_shf = _shb64.b64encode(_shb.getvalue()).decode("ascii")
+app2._share_frame({"image": _shf, "seq": 1})
+app2.update()
+check("[share] a frame paints into the overlay",
+      _alive(getattr(app2, "_share_win", None))
+      and getattr(app2._share_win.label, "image", None) is not None)
+check("[share] the freshness stamp tracks the last frame",
+      _time.time() - app2._share_last < 5, str(app2._share_last))
+_sh_ok = True
+try:
+    app2._share_frame({"image": "A" * (_SHMAX + 1), "seq": 2})
+except Exception:
+    _sh_ok = False
+check("[share] an oversized frame is dropped without decoding",
+      _sh_ok and _alive(getattr(app2, "_share_win", None)))
+app2._share_close("test cleanup")
+check("[share] close is idempotent", app2._share_win is None)
+app2._share_frame({"image": _shf, "seq": 3})
+app2.update()
+check("[share] a frame with no overlay reopens it (mid-share rejoin)",
+      _alive(getattr(app2, "_share_win", None)))
+app2.handle_command(Message.create(MessageType.CMD_SCREEN_SHARE_STOP,
+                                   {"command_id": "sh2"}))
+app2.update()
+check("[share] the STOP command closes the overlay",
+      getattr(app2, "_share_win", None) is None
+      and any(e.get("message") == "Screen share closed"
+              for e in _ls.pending_logs(500)))
+app2.handle_command(Message.create(MessageType.CMD_SCREEN_SHARE_START,
+                                   {"command_id": "sh3", "admin": "tester"}))
+app2.update()
+app2._share_last = _time.time() - 10
+app2._share_tick()
+check("[share] frozen frames time the overlay out (no stale slide)",
+      getattr(app2, "_share_win", None) is None)
+
 # --- P1-8 Remote control: a durable, honest record on the PC itself -------
 app2.net.connected = False            # worst case: the link is already down
 app2.handle_command(Message.create(MessageType.CMD_SCREEN_OBSERVE_STOP,

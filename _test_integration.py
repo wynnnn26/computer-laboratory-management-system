@@ -1524,6 +1524,8 @@ check("attendance feature removed server-side",
 
 # ---------------------------------------------------------------- commands
 stop_reader = threading.Event()
+share_frames = []    # screen-share payloads the fake PC received (no acks)
+share_stops = []     # every CMD_SCREEN_SHARE_STOP the fake PC received
 def client_loop():
     while not stop_reader.is_set():
         msg = w.recv_message(timeout=0.3)
@@ -1532,6 +1534,11 @@ def client_loop():
                 w.sock.getpeername(); continue
             except Exception:
                 break
+        if msg.type == MessageType.CMD_SCREEN_SHARE_FRAME.value:
+            share_frames.append(msg.payload)   # content: never acked
+            continue
+        if msg.type == MessageType.CMD_SCREEN_SHARE_STOP.value:
+            share_stops.append(msg)            # a command: falls through
         if msg.type == MessageType.CMD_SCREENSHOT.value:
             out = Message(type=MessageType.CMD_SCREENSHOT.value,
                           payload={"image": "ZmFrZQ==", "pc_name": "TEST-PC",
@@ -1582,6 +1589,104 @@ check("observe audit row carries the id sent to the client",
 check("observe audit row is resolved by the real acknowledgement",
       row is not None and row["executed_at"] is not None,
       f"executed_at={row['executed_at'] if row else None}")
+
+# --- Screen share: THIS machine's screen -> every online lab PC ------------
+import base64 as _sh_b64
+res = srv.start_screen_share("tester", role="staff")
+check("share is ADMINISTRATOR-only at the server",
+      res.get("success") is False, str(res))
+check("a refused share starts no worker", srv.share_stop is None)
+
+class _DeadEntry:
+    """Online but unwritable PC: one failed send must drop it for good."""
+    def __init__(self):
+        self.is_online = True
+        self.calls = 0
+    def send(self, msg):
+        self.calls += 1
+        return False
+    def close(self):
+        pass
+
+_dead = _DeadEntry()
+srv.clients["LAGGY-PC"] = _dead
+res = srv.start_screen_share("tester", role="admin")
+check("share starts and names the PC it reached",
+      res.get("success") is True and res.get("pcs") == ["TEST-PC"],
+      str(res))
+check("the unwritable PC is refused, not accepted",
+      "LAGGY-PC" not in (res.get("pcs") or []), str(res))
+row = database.get_connection().execute(
+    "SELECT status FROM client_commands WHERE command_type="
+    "'cmd_screen_share_start' AND target_pc='LAGGY-PC'").fetchone()
+check("the refused PC's START is audited Failed, not left Sent",
+      row is not None and row["status"] == "Failed",
+      str(dict(row) if row else None))
+_ev = srv.share_stop
+check("a second start is a no-op on the same worker",
+      srv.start_screen_share("tester", role="admin").get("already") is True
+      and srv.share_stop is _ev)
+for _ in range(40):                        # up to 2 s for >= 2 frames
+    if len(share_frames) >= 2:
+        break
+    time.sleep(0.05)
+check("frames reach the live PC", len(share_frames) >= 2,
+      str(len(share_frames)))
+try:
+    _sh_raw = _sh_b64.b64decode(share_frames[-1].get("image", ""))
+except Exception:
+    _sh_raw = b""
+check("a frame is a real JPEG captured off the desktop",
+      _sh_raw[:2] == b"\xff\xd8", f"len={len(_sh_raw)}")
+check("frames advance (no stale frame repeated)",
+      len(share_frames) >= 2
+      and share_frames[-1].get("seq", 0) > share_frames[0].get("seq", 0),
+      str([f.get("seq") for f in share_frames[:5]]))
+check("one failed send drops the PC after a single attempt",
+      _dead.calls == 2, str(_dead.calls))   # START + exactly one frame
+row = database.get_connection().execute(
+    "SELECT command_id, status, executed_at FROM client_commands "
+    "WHERE command_type='cmd_screen_share_start' AND target_pc='TEST-PC' "
+    "ORDER BY id DESC LIMIT 1").fetchone()
+check("share START audit carries the id sent to the client",
+      row is not None and len(str(row["command_id"] or "")) >= 8,
+      str(dict(row) if row else None))
+check("share START is resolved by the fake PC's real ack",
+      row is not None and row["executed_at"] is not None,
+      f"executed_at={row['executed_at'] if row else None}")
+res = srv.stop_screen_share("tester", role="admin")
+check("stop clears the worker state at once",
+      res.get("success") is True and srv.share_stop is None, str(res))
+for _ in range(40):                        # worker exit: STOP delivery
+    if share_stops:
+        break
+    time.sleep(0.05)
+check("every streamed PC is told to stop", len(share_stops) == 1,
+      str(len(share_stops)))
+for _ in range(40):                        # the STOP ack travels back async
+    row = database.get_connection().execute(
+        "SELECT command_id, executed_at FROM client_commands "
+        "WHERE command_type='cmd_screen_share_stop' AND target_pc='TEST-PC' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    if row and row["executed_at"]:
+        break
+    time.sleep(0.05)
+check("share STOP is audited and ack-resolved",
+      row is not None and row["executed_at"] is not None,
+      str(dict(row) if row else None))
+check("the dropped PC still gets its STOP attempt (audited honestly)",
+      _dead.calls == 3, str(_dead.calls))
+res = srv.stop_screen_share("tester", role="admin")
+check("stopping a dead share is a clean no-op",
+      res.get("success") is True and res.get("not_sharing") is True,
+      str(res))
+srv.clients["TEST-PC"].is_online = False
+res = srv.start_screen_share("tester", role="admin")
+check("no PC online -> the share refuses cleanly",
+      res.get("success") is False, str(res))
+srv.clients["TEST-PC"].is_online = True
+srv.clients.pop("LAGGY-PC", None)
+check("the helper PC is removed again", "LAGGY-PC" not in srv.clients)
 
 # --- Task 5: remote mouse/keyboard control -------------------------------
 from protocol import sanitize_remote_events, build_remote_input
@@ -2241,7 +2346,13 @@ _rp = _PILImageTk.PhotoImage(_PILImage.new("RGB", (320, 180), (30, 60, 120)))
 _rl.configure(image=_rp, text="")
 _rl.image = _rp
 _rw.geometry("1150x780+60+60")
-root.update(); root.update_idletasks()
+# The window manager applies geometry asynchronously: poll until the label
+# has actually expanded, so the fit check never reads a pre-map size.
+for _ in range(40):
+    root.update(); root.update_idletasks()
+    if _rl.winfo_width() >= 500:
+        break
+    time.sleep(0.05)
 _iw, _ih = _rp.width(), _rp.height()
 _lw, _lh = _rl.winfo_width(), _rl.winfo_height()
 check("[remote] test photo fits inside the viewer label",

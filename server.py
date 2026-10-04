@@ -221,6 +221,12 @@ class LabServer:
         self.server_ssl = None
         self.threads = []
         self.screen_watchers = {}         # pc_name -> stop Event
+        # Screen share (teaching): ONE active share to ALL online lab PCs.
+        # `share_stop` is the capture worker's stop Event (None = idle);
+        # `share_targets` is every PC that was sent a START or a frame -
+        # the worker's exit path delivers the audited STOP to exactly those.
+        self.share_stop = None
+        self.share_targets = set()
         # Task 5: one ACTIVE remote-control session per PC at most.
         # pc_name -> {"admin", "session_id", "started_at"}; guarded by its
         # own lock because input forwarding happens on reader threads.
@@ -302,6 +308,10 @@ class LabServer:
             self.clients.clear()
         for ev in list(self.screen_watchers.values()):
             ev.set()
+        # Screen share: end the capture worker too; clients learn the link
+        # is gone from their own disconnect handler and close the overlay.
+        if self.share_stop is not None:
+            self.share_stop.set()
         # Task 5: nothing survives a server shutdown - end every remote
         # control session (audited) rather than leaving one dangling.
         for name in list(getattr(self, "remote_sessions", {}) or {}):
@@ -2014,6 +2024,131 @@ class LabServer:
             self._audit_done(command_id, False, "target not connected")
         self._log_activity(admin, "screen_observe_stop", pc, "")
         return True
+
+    # ---------------------------------------------------- screen share
+    # Teaching share: THIS machine's screen pushed to every online lab PC
+    # (PowerPoint, live coding).  Display-only by construction - a frame
+    # is a base64 JPEG string with nothing executable, frames carry no
+    # command_id (no per-frame ack/audit), and only ADMINISTRATOR may
+    # start or stop a share (the same gate as Observe / Remote).
+    #: classroom defaults: text must stay readable (scale 0.75 at 4:4:4
+    #: quality 85), and one frame every 200 ms is plenty for slides and
+    #: live typing while staying kind to a lab switch's uplink.
+    SHARE_INTERVAL = 0.2
+    SHARE_QUALITY = 85
+    SHARE_SCALE = 0.75
+
+    def start_screen_share(self, admin="", role="") -> dict:
+        """Start streaming this machine's screen to every online client."""
+        if not self._observe_role_ok(role, admin, "screen_share_start", "-"):
+            return {"success": False, "error": "administrator only"}
+        if self.share_stop is not None:
+            return {"success": True, "already": True}
+        from protocol import build_screen_share_start
+        with self.clients_lock:
+            names = [n for n, e in self.clients.items() if e.is_online]
+        if not names:
+            return {"success": False, "error": "no PC online"}
+        stop = threading.Event()
+        accepted = []
+        for name in names:
+            entry = self.get_client(name)
+            if not entry or not entry.is_online:
+                continue
+            # P1-8 pattern: the ack the client already sends resolves this
+            # row from Sent -> Done/Failed, never pre-stamped "Done".
+            command_id = self._audit_command(
+                name, "cmd_screen_share_start", {"admin": admin},
+                admin, status="Sent")
+            msg = build_screen_share_start(admin)
+            msg.payload["command_id"] = command_id
+            if entry.send(msg):
+                accepted.append(name)
+            else:
+                self._audit_done(command_id, False, "send failed")
+        if not accepted:
+            return {"success": False, "error": "no PC accepted the share"}
+        self.share_targets = set(accepted)
+        self.share_stop = stop
+        threading.Thread(target=self._share_worker, args=(stop, admin),
+                         daemon=True, name="screen-share").start()
+        self._log_activity(admin, "screen_share_start",
+                           f"{len(accepted)} PCs", "")
+        return {"success": True, "pcs": accepted}
+
+    def stop_screen_share(self, admin="", role="") -> dict:
+        """Stop the active share (idempotent; never raises)."""
+        if not self._observe_role_ok(role, admin, "screen_share_stop", "-"):
+            return {"success": False, "error": "administrator only"}
+        stop = self.share_stop
+        if stop is None:
+            return {"success": True, "not_sharing": True}
+        stop.set()
+        self.share_stop = None
+        self._log_activity(admin, "screen_share_stop", "-", "")
+        # The worker's exit path audits and delivers the STOP to every PC
+        # it streamed to, AFTER its last frame - same socket, TCP order,
+        # so the Client can never reopen on a frame arriving post-STOP.
+        return {"success": True}
+
+    def _share_worker(self, stop, admin=""):
+        """Capture -> fan-out loop; owns the STOP delivery on exit.
+
+        A PC whose send fails is dropped from the fan-out (lagging) so one
+        wedged client can never stall the class; it still gets a STOP
+        attempt, audited honestly as Failed if the link is truly gone.
+        """
+        from protocol import build_screen_share_frame, build_screen_share_stop
+        from utils import capture_screen_b64
+        seq = 0
+        lagging = set()
+        try:
+            while not stop.is_set():
+                t0 = time.time()
+                with self.clients_lock:
+                    entries = [(n, e) for n, e in self.clients.items()
+                               if e.is_online]
+                if not entries:
+                    # nobody is watching - don't burn CPU capturing
+                    stop.wait(1.0)
+                    continue
+                try:
+                    frame = capture_screen_b64(self.SHARE_QUALITY,
+                                               self.SHARE_SCALE)
+                except Exception:
+                    # capture can fail (locked desktop, no interactive
+                    # session) - retry quietly while the share is on
+                    stop.wait(1.0)
+                    continue
+                seq += 1
+                for name, entry in entries:
+                    if name in lagging:
+                        continue
+                    self.share_targets.add(name)   # late joiners too
+                    # ponytail: sequential blocking sends (same trust as
+                    # the file push); per-PC worker + send timeout if a
+                    # wedged peer ever proves to matter in practice.
+                    if not entry.send(build_screen_share_frame(frame, seq)):
+                        lagging.add(name)
+                stop.wait(max(0.0, self.SHARE_INTERVAL - (time.time() - t0)))
+        finally:
+            if self.share_stop is stop:
+                self.share_stop = None
+            with self.clients_lock:
+                names = [n for n in self.share_targets
+                         if n in self.clients and self.clients[n].is_online]
+            for name in names:
+                entry = self.clients.get(name)
+                if not entry:
+                    continue
+                command_id = self._audit_command(
+                    name, "cmd_screen_share_stop", {}, admin, status="Sent")
+                msg = build_screen_share_stop()
+                msg.payload["command_id"] = command_id
+                if not entry.send(msg):
+                    self._audit_done(command_id, False, "send failed")
+            self._log_activity(admin or "-", "screen_share_stop",
+                               f"{len(names)} PCs", "share ended")
 
     # ---------------------------------------------------- remote control
     def get_remote_session(self, pc):

@@ -3,7 +3,9 @@ utils.py
 Shared helpers: CSV export, styling constants, small UI helpers.
 """
 
+import base64
 import csv
+import io
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
@@ -34,6 +36,29 @@ from theme import (
 # Kept in theme.py (imported above) so the Server and the Client always
 # share one set of labels, colours and icons.  The SERVER remains the
 # single authoritative source (server.derive_status); these only render it.
+
+
+# ---- Screen capture ---------------------------------------------------------
+def capture_screen_b64(quality: int = 50, scale: float = 0.5) -> str:
+    """Grab the local screen and return it as a base64-encoded JPEG.
+
+    Shared by both processes: the Client streams it for `[Observe]` /
+    screenshots, the Server produces the teaching screen share pushed to
+    lab PCs.  `subsampling=0` (4:4:4 chroma) keeps small text, syntax
+    colours and slide artwork accurate - the streams exist to be READ.
+    PIL is imported lazily, so merely importing utils never pulls it in.
+    """
+    import PIL.Image as PILImage
+    from PIL import ImageGrab
+    img = ImageGrab.grab()
+    if scale and scale != 1.0:
+        w, h = int(img.width * scale), int(img.height * scale)
+        resample = getattr(PILImage, "Resampling", PILImage)
+        img = img.resize((w, h), resample.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=max(10, min(95, quality)),
+             subsampling=0)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def render_status_tile(state, size=256):
