@@ -79,7 +79,7 @@ decides which one it is; nothing else needs to change.
 | Student UI | `student_dashboard.py` | Announcements / messages / borrowing (:38) |
 | Data bridge | `client_api.py` | Network-first fetches for the student UI with SQLite fallback (:17) |
 | UI framework | `components.py`, `theme.py`, `utils.py`, `crud_frame.py` | Shared widgets, design tokens, styling helpers, reusable CRUD tables/pages |
-| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py` | 517 + 252 + 50 checks, self-contained |
+| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py` | 529 + 252 + 50 checks, self-contained |
 | Build | `build_exe.bat`, `requirements.txt` | PyInstaller onefile builds for both apps |
 | Assets | `assets/`, `pc_icons/`, `app_icon.ico` | Logo, 8 PC status icons, window icon |
 | Design docs | `design-system/lab-management-system/MASTER.md` | Token/component spec behind `theme.py` |
@@ -116,16 +116,18 @@ This is why both EXEs are built from the same `main.py`.
    `admin | staff | maintenance` → `AdminDashboard`, `student` →
    `StudentDashboard`. Tearing the window down stops the server.
 
-### 3.3 Client mode (`run_client`, `client.py:3760`)
+### 3.3 Client mode (`run_client`, `client.py:3930`)
 
-1. `acquire_single_instance()` (:915) — named mutex
+1. `acquire_single_instance()` (:924) — named mutex
    `Local\ComputerLaboratoryClient`; a second launch re-opens the first.
 2. Registers two unelevated Windows scheduled tasks — one *at log on*, one
    *every minute* — that relaunch the kiosk if the process ever dies
-   (`register_watchdog` :3641).
+   (`register_watchdog` :3789, which also repairs a task whose stored
+   command went stale or was deleted; a running kiosk re-verifies every
+   15 minutes via `_watchdog_heal_loop` :3822).
 3. Builds `ClientApp` (fullscreen login card) and starts `ClientNetwork`
    with the address from `lab_config.json`, falling back to **UDP
-   discovery** if no address is stored (`discover_server_ip` :209).
+   discovery** if no address is stored (`discover_server_ip` :210).
 
 ---
 
@@ -417,7 +419,7 @@ exiting non-zero on any failure:
 
 | Suite | Checks | Covers |
 |---|---|---|
-| `_test_integration.py` | **517** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands, dashboard layout, role gating, Accounts bulk CSV upload, Send File desktop push, guardrails, the standalone uninstaller |
+| `_test_integration.py` | **529** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands, dashboard layout, role gating, Accounts bulk CSV upload, Send File desktop push, guardrails, watchdog registration repair + self-heal, the standalone uninstaller (static + behavioural) |
 | `_test_client_gui.py` | **252** | kiosk state machine, lock/pause/logout, command de-dup, offline login + local queue, web policy ack, watchdog, hotkeys, observe clamps, Send File dispatch |
 | `_probe_layout.py` | **50** | responsive layout at 1080×700 / 1280×780 / 1440×900 |
 

@@ -3716,30 +3716,122 @@ def _task_exists(name):
     return rc == 0
 
 
-def register_watchdog():
-    """Best-effort: register the Task Scheduler watchdog for this client.
+def _split_command(cmdline):
+    """(program, arguments) of a /TR command line - the same split
+    schtasks applies, so both sides of the staleness check agree."""
+    s = str(cmdline).strip()
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        return (s[1:end], s[end + 1:].strip()) if end > 0 else (s[1:], "")
+    parts = s.split(None, 1)
+    return parts[0], parts[1] if len(parts) > 1 else ""
 
-    Idempotent (existing tasks are reused), never raises and never blocks
+
+def _task_command(name):
+    """(exists, program, arguments) from the task's own /XML definition.
+
+    XML tags are never localized (unlike the /V list text) and schtasks
+    keeps the quoting, so the caller normalises both sides.  An unreadable
+    definition counts as present-but-unknown, which the caller repairs by
+    recreating - a /Create carrying the right command always leaves the
+    task correct.  Never raises."""
+    try:
+        rc, out = _schtasks(["/Query", "/TN", name, "/XML"])
+        if rc != 0:
+            return False, "", ""
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(out)
+        return (True,
+                (root.findtext(".//{*}Command") or "").strip(),
+                (root.findtext(".//{*}Arguments") or "").strip())
+    except Exception:
+        return True, "", ""
+
+
+def _task_matches(name, cmd):
+    """True only when `name` exists AND would run exactly `cmd`.
+
+    The staleness hole `register_startup()` already closes for the HKCU
+    Run entry by rewriting it on every start: a watchdog task left
+    pointing at a moved exe or an old dev path ticks forever against
+    nothing, and a killed client never comes back."""
+    exists, exe, args = _task_command(name)
+    if not exists:
+        return False
+    want_exe, want_args = _split_command(cmd)
+    return (exe.strip('"').lower() == want_exe.strip('"').lower()
+            and args.strip().lower() == want_args.strip().lower())
+
+
+# Self-heal cadence (knob): how often a running kiosk re-verifies the two
+# tasks - 15 min costs two background /Query calls and nothing else.
+_WATCHDOG_HEAL_SECONDS = 900
+_WD_EVIDENCE_AT = 0.0          # throttled: one WARN line per hour
+
+
+def _watchdog_evidence(severity, message):
+    """Durable evidence in the local log (P1-6): a failed or repaired
+    watchdog registration must be readable after the fact - a console
+    print is invisible inside a windowed exe.  Failures are throttled so
+    a permanently broken schtasks cannot flood the log.  Never raises."""
+    global _WD_EVIDENCE_AT
+    try:
+        if severity == "WARN":
+            now = time.time()
+            if now - _WD_EVIDENCE_AT < 3600:
+                return
+            _WD_EVIDENCE_AT = now
+        local_store.log_event(severity, "startup", message)
+    except Exception:
+        pass
+
+
+def register_watchdog():
+    """Best-effort: register AND REPAIR the Task Scheduler watchdog.
+
+    Idempotent and self-healing: a task that is missing, or whose stored
+    command no longer matches this app (exe moved, dev run vs dist exe),
+    is recreated with /F; a healthy task is left untouched, so a normal
+    start performs zero schtasks writes.  Never raises and never blocks
     a start: the HKCU Run entry alone already brings the kiosk up, so a
-    failed registration is logged and ignored.  Returns True when the
-    repeating task is in place - that is the one that actually restarts a
-    client that crashed, was closed or was killed.
-    """
+    failed registration is recorded in the local log and ignored.
+    Returns True when the repeating task is in place - that is the one
+    that actually restarts a client that crashed, was closed or was
+    killed in Task Manager (worst case a minute later, when its next
+    tick finds the single-instance mutex free)."""
     if platform.system() != "Windows":
         return False
     cmd = _watchdog_command()
-    if not _task_exists(WATCHDOG_TASK_LOGON):
+    if not _task_matches(WATCHDOG_TASK_LOGON, cmd):
         # A logon trigger can be refused without elevation; harmless, the
         # HKCU Run entry already covers signing in.
         _schtasks(["/Create", "/TN", WATCHDOG_TASK_LOGON, "/TR", cmd,
                    "/SC", "ONLOGON", "/F", "/RL", "LIMITED"])
-    if _task_exists(WATCHDOG_TASK_REPEAT):
+    if _task_matches(WATCHDOG_TASK_REPEAT, cmd):
         return True
     rc, out = _schtasks(["/Create", "/TN", WATCHDOG_TASK_REPEAT, "/TR", cmd,
                          "/SC", "MINUTE", "/MO", "1", "/F", "/RL", "LIMITED"])
     if rc != 0:
         print(f"[CLIENT] Watchdog task not scheduled: {out}")
-    return rc == 0
+        _watchdog_evidence("WARN", f"Watchdog registration failed: {out}")
+        return False
+    _watchdog_evidence("INFO", "Watchdog task ready (repeats every minute)")
+    return True
+
+
+def _watchdog_heal_loop():
+    """P1-4 hardening: while the kiosk runs, re-verify the tasks every
+    _WATCHDOG_HEAL_SECONDS and repair them - closing the window where a
+    task deleted or made stale during a session would silently remove
+    the last line of defence before anyone kills the client.  Sleeps
+    first (start-up just registered), daemon thread, never raises and
+    never touches Tk."""
+    while True:
+        time.sleep(_WATCHDOG_HEAL_SECONDS)
+        try:
+            register_watchdog()
+        except Exception as e:
+            print(f"[CLIENT] Watchdog self-heal skipped: {e}")
 
 
 def remove_watchdog():
@@ -3864,6 +3956,8 @@ def run_client():
         # never delay the lock screen.  Best effort by design.
         threading.Thread(target=_register_watchdog_quiet, daemon=True,
                          name="watchdog-reg").start()
+        threading.Thread(target=_watchdog_heal_loop, daemon=True,
+                         name="watchdog-heal").start()
         try:
             app.start_tray()    # notification-area icon (no-op if unsupported)
             app.mainloop()

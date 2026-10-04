@@ -385,7 +385,11 @@ with.
   Laboratory Client Logon** (`/SC ONLOGON`) and **Computer Laboratory
   Client Watchdog** (`/SC MINUTE /MO 1`), both unelevated — relaunch it
   with `--watchdog` if it ever stops, so a lab PC returns to the kiosk
-  after a crash, a sign-out or a reboot; starting the Server on that
+  after a crash, a sign-out, a reboot or a Task Manager kill. Every
+  registration — at start-up, then every 15 minutes while the kiosk
+  runs — compares each task's stored command with this app and repairs
+  a stale or deleted task (a refused registration lands in the local
+  log as a throttled WARN); starting the Server on that
   same machine removes both tasks so a kiosk can never open on top of
   the Admin console. `python main.py --uninstall-startup` removes the
   Windows Startup entry and both tasks and exits without opening the
@@ -578,7 +582,7 @@ and the eight `pc_icons/*.png` status icons.
 ## Tests
 
 ```
-python _test_integration.py   # 517 checks: TLS framing, auth & role claim,
+python _test_integration.py   # 529 checks: TLS framing, auth & role claim,
                               # first-login password change (flagged
                               # accounts, sessions blocked until changed,
                               # hashed storage, audit rows),
@@ -648,6 +652,15 @@ python _test_integration.py   # 517 checks: TLS framing, auth & role claim,
                                # (one re-validated PID, cooldown, create-
                                # time match, missing rights reported as
                                # FAILED instead of SYNCED),
+                               # watchdog hardening (missing, stale or
+                               # mid-session-deleted tasks repaired with
+                               # THIS app's command, healthy tasks never
+                               # rewritten, refused registration recorded
+                               # as a throttled WARN) and the uninstaller's
+                               # real behaviour (both /Delete commands,
+                               # missing task = done, verify-after stop,
+                               # FAILED never self-deletes, a failed export
+                               # keeps the audit database),
                                # and the P1.5 safety sign-off - 11
                                # guardrail checks that fail the gate if
                                # any non-negotiable erodes: no hardware/
@@ -827,7 +840,7 @@ lab_system/
 │                         pc_icons/ status icons, --collect-all
 │                         customtkinter for the dark UI; client.exe also
 │                         pulls in the pystray Windows backend)
-├── _test_integration.py  517-check end-to-end suite (server + protocol +
+├── _test_integration.py  529-check end-to-end suite (server + protocol +
 │                         admin dashboard)
 ├── _test_client_gui.py   252-check kiosk state-machine suite
 ├── _probe_layout.py      Responsive layout probe (no clipped rows or

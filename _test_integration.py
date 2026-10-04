@@ -4095,6 +4095,231 @@ check("[uninstall] imports without side effects (all work lives in main)",
       callable(_un.main) and callable(_un.stop_client)
       and callable(_un.export_and_remove_files), "import-only")
 
+# ---- watchdog: registration repairs stale / missing tasks (P1-4)-----------
+# _schtasks is swapped for a stateful fake, so NO real task is ever
+# created here - a real watchdog tick would open a kiosk on this desktop.
+_wd_sch_orig = client_mod._schtasks
+_wd_ev_orig = client_mod._watchdog_evidence
+_wd_state = {}          # task name -> stored /TR (what /Create remembers)
+_wd_calls = []          # every argv the code passes to schtasks
+_wd_ev = []             # (severity, message) evidence records
+_wd_fail_create = [False]
+
+
+def _wd_fake_schtasks(args):
+    args = list(args)
+    _wd_calls.append(args)
+    op = args[0]
+    name = args[args.index("/TN") + 1] if "/TN" in args else ""
+    if op == "/Query":
+        if name not in _wd_state:
+            return 1, "ERROR: The system cannot find the file specified."
+        if "/XML" not in args:
+            return 0, f"TaskName: {name}"
+        tr = _wd_state[name]
+        if tr.startswith('"'):
+            i = tr.find('"', 1)
+            exe, rest = (tr[:i + 1], tr[i + 1:].strip()) if i > 0 else (tr, "")
+        else:
+            p = tr.split(None, 1)
+            exe, rest = p[0], (p[1] if len(p) > 1 else "")
+        # the real shape: namespace + quoting kept (matches schtasks /XML)
+        return 0, (
+            '<?xml version="1.0" encoding="UTF-16"?>\n\n'
+            '<Task version="1.2" xmlns="http://schemas.microsoft.com/'
+            'windows/2004/02/mit/task">\n<Actions><Exec>'
+            f"<Command>{exe}</Command><Arguments>{rest}</Arguments>"
+            "</Exec></Actions>\n</Task>")
+    if op == "/Create":
+        if _wd_fail_create[0]:
+            return 1, "ERROR: Access is denied."
+        _wd_state[name] = args[args.index("/TR") + 1]
+        return 0, "SUCCESS: created"
+    if op == "/Delete":
+        _wd_state.pop(name, None)
+        return 0, "SUCCESS: deleted"
+    return 1, "unexpected schtasks call"
+
+
+client_mod._schtasks = _wd_fake_schtasks
+client_mod._watchdog_evidence = lambda sev, msg: _wd_ev.append((sev, msg))
+try:
+    _wdcmd = client_mod._watchdog_command()
+    # missing -> both tasks created with the right schedules and command
+    _wd_calls.clear()
+    _wd_state.clear()
+    _wd_ev.clear()
+    _ok = client_mod.register_watchdog()
+    _creates = [c for c in _wd_calls if c[0] == "/Create"]
+    check("[watchdog] missing tasks are (re)created with this app's command",
+          _ok is True and len(_creates) == 2
+          and {c[c.index("/TN") + 1] for c in _creates}
+          == {client_mod.WATCHDOG_TASK_LOGON, client_mod.WATCHDOG_TASK_REPEAT}
+          and all(c[c.index("/TR") + 1] == _wdcmd for c in _creates)
+          and any(c[c.index("/SC") + 1] == "MINUTE"
+                  and c[c.index("/MO") + 1] == "1" for c in _creates)
+          and any(c[c.index("/SC") + 1] == "ONLOGON" for c in _creates),
+          str(_creates))
+    # healthy -> zero writes (a normal start is query-only, no churn)
+    _wd_calls.clear()
+    _ok = client_mod.register_watchdog()
+    check("[watchdog] a healthy watchdog is never rewritten (no churn)",
+          _ok is True and not [c for c in _wd_calls if c[0] == "/Create"],
+          str(_wd_calls))
+    # stale: the task exists but points at something else (moved exe, old
+    # dev path) - the exact hole that let a Task Manager kill go unwatched
+    _wd_state[client_mod.WATCHDOG_TASK_REPEAT] = '"C:\\old\\moved.exe" --watchdog'
+    _wd_calls.clear()
+    _ok = client_mod.register_watchdog()
+    _creates = [c for c in _wd_calls if c[0] == "/Create"]
+    check("[watchdog] a stale Task To Run is repaired with THIS app's command",
+          _ok is True and len(_creates) == 1
+          and _creates[0][_creates[0].index("/TN") + 1]
+          == client_mod.WATCHDOG_TASK_REPEAT
+          and _creates[0][_creates[0].index("/TR") + 1] == _wdcmd,
+          str(_creates))
+    # deleted mid-session -> the self-heal pass restores it and leaves
+    # evidence in the durable local log
+    del _wd_state[client_mod.WATCHDOG_TASK_REPEAT]
+    _wd_calls.clear()
+    _wd_ev.clear()
+    _ok = client_mod.register_watchdog()
+    with open(client_mod.__file__, encoding="utf-8") as _f:
+        _wdsrc = _f.read()
+    check("[watchdog] the self-heal pass restores a task deleted mid-session",
+          _ok is True and client_mod.WATCHDOG_TASK_REPEAT in _wd_state
+          and 'name="watchdog-heal"' in _wdsrc
+          and any(s == "INFO" and "Watchdog" in m for s, m in _wd_ev),
+          f"ok={_ok} ev={_wd_ev}")
+    # a refused registration reports False and records WARN evidence
+    _wd_state.pop(client_mod.WATCHDOG_TASK_REPEAT, None)
+    _wd_fail_create[0] = True
+    _wd_ev.clear()
+    _ok = client_mod.register_watchdog()
+    check("[watchdog] a refused registration reports False + local evidence",
+          _ok is False
+          and any(s == "WARN" and "failed" in m.lower() for s, m in _wd_ev),
+          f"ok={_ok} ev={_wd_ev}")
+    _wd_fail_create[0] = False
+finally:
+    client_mod._schtasks = _wd_sch_orig
+    client_mod._watchdog_evidence = _wd_ev_orig
+# the WARN throttle, exercised on the REAL function with log_event caught
+_ls_orig_log = client_mod.local_store.log_event
+_ls_rows = []
+client_mod.local_store.log_event = lambda *a, **k: (_ls_rows.append(a), "")[1]
+try:
+    client_mod._WD_EVIDENCE_AT = 0.0
+    _wd_ev_orig("WARN", "throttle probe 1")
+    _wd_ev_orig("WARN", "throttle probe 2")
+finally:
+    client_mod.local_store.log_event = _ls_orig_log
+    client_mod._WD_EVIDENCE_AT = 0.0
+check("[watchdog] WARN evidence is throttled to one per hour",
+      len(_ls_rows) == 1 and _ls_rows[0][0] == "WARN"
+      and "throttle probe 1" in _ls_rows[0][2], str(_ls_rows))
+
+# ---- standalone uninstall: behavioural (the checks above are static)-------
+# Everything real is faked: _run never spawns taskkill/schtasks, the file
+# step works on a temp directory - the gate's own DB cannot be touched.
+import shutil as _shutil
+_un_run_orig = _un._run
+_un_saved = {n: getattr(_un, n) for n in (
+    "remove_tasks", "remove_run_entry", "stop_client",
+    "export_and_remove_files", "_report", "_self_delete", "_base_dir")}
+try:
+    # remove_tasks issues real deletion commands for BOTH exact names
+    _calls = []
+    _un._run = lambda a: (_calls.append(list(a)), (0, "SUCCESS"))[1]
+    _m = _un.remove_tasks()
+    check("[uninstall] remove_tasks deletes both tasks with /F",
+          len(_calls) == 2
+          and all(c[0] == "schtasks" and c[1] == "/Delete"
+                  and "/F" in c for c in _calls)
+          and {c[c.index("/TN") + 1] for c in _calls}
+          == {_un.WATCHDOG_TASK_LOGON, _un.WATCHDOG_TASK_REPEAT}
+          and not [m for m in _m if m.startswith("FAILED")],
+          str(_calls))
+    # a missing task is 'already gone', never a FAILED (rerun-safe)
+    _un._run = lambda a: (1, "ERROR: The system cannot find the file "
+                              "specified.")
+    _m = _un.remove_tasks()
+    check("[uninstall] a missing task counts as done (rerun is safe)",
+          len(_m) == 2 and all("already gone" in m for m in _m),
+          str(_m))
+    # stop_client verifies: gone -> success, still listed -> FAILED
+    _un._run = lambda a: ((0, "INFO: No tasks are running which match the "
+                              "specified criteria.")
+                          if a[0] == "tasklist" else (0, ""))
+    _gone = _un.stop_client()
+    _un._run = lambda a: ((0, "client.exe Console 1 5,000 K")
+                          if a[0] == "tasklist" else (0, ""))
+    _still = _un.stop_client()
+    check("[uninstall] stop_client verifies instead of claiming green",
+          _gone.startswith("Client stopped")
+          and _still.startswith("FAILED: client.exe is still running"),
+          f"gone={_gone!r} still={_still!r}")
+    # happy path: steps in order, exit 0, self-delete last
+    _seq = []
+    _un.remove_tasks = lambda: (_seq.append("tasks"),
+                                ["Task removed: x"])[1]
+    _un.remove_run_entry = lambda: (_seq.append("run"),
+                                    "Startup entry removed: x")[1]
+    _un.stop_client = lambda: (_seq.append("stop"),
+                               "Client stopped (client.exe is not running)")[1]
+    _un.export_and_remove_files = lambda: (_seq.append("files"),
+                                           ["File removed: client.exe"])[1]
+    _un._report = lambda lines, ok, quiet: _seq.append(("report", ok, quiet))
+    _un._self_delete = lambda: _seq.append("selfdelete")
+    _rc = _un.main(["--quiet"])
+    check("[uninstall] happy path: ordered steps, exit 0, self-delete last",
+          _rc == 0
+          and _seq == ["tasks", "run", "stop", "files",
+                       ("report", True, True), "selfdelete"],
+          str(_seq))
+    # a FAILED anywhere -> exit 1, no self-delete, operator told to rerun
+    _seq.clear()
+    _un.stop_client = lambda: (_seq.append("stop"),
+                               "FAILED: client.exe is still running - run "
+                               "this uninstall app as Administrator")[1]
+    _rc = _un.main(["--quiet"])
+    check("[uninstall] a FAILED step exits 1 and never self-deletes",
+          _rc == 1 and ("report", False, True) in _seq
+          and "selfdelete" not in _seq,
+          str(_seq))
+    # P1-6: a failed export KEEPS the audit database; other files still go
+    # (real file logic - the happy-path step fakes are restored first)
+    for _n2 in ("remove_tasks", "remove_run_entry", "stop_client",
+                "export_and_remove_files"):
+        setattr(_un, _n2, _un_saved[_n2])
+    _tmp = tempfile.mkdtemp(prefix="unins_")
+    try:
+        for _n in ("lab_client.db", "client.exe", "lab_config.json"):
+            with open(os.path.join(_tmp, _n), "w") as _f:
+                _f.write("x")
+        import local_store as _lsmod
+        _dbp, _exp = _lsmod.db_path, _lsmod.export_logs
+        _un._base_dir = lambda: _tmp
+        _lsmod.db_path = lambda: os.path.join(_tmp, "lab_client.db")
+        _lsmod.export_logs = lambda dest=None: None    # export FAILS
+        try:
+            _m = _un.export_and_remove_files()
+        finally:
+            _lsmod.db_path, _lsmod.export_logs = _dbp, _exp
+        check("[uninstall] a failed export KEEPS the audit database (P1-6)",
+              os.path.exists(os.path.join(_tmp, "lab_client.db"))
+              and not os.path.exists(os.path.join(_tmp, "client.exe"))
+              and not os.path.exists(os.path.join(_tmp, "lab_config.json"))
+              and any("could not be exported" in m for m in _m)
+              and any("File removed: client.exe" in m for m in _m),
+              str(_m))
+    finally:
+        _shutil.rmtree(_tmp, ignore_errors=True)
+finally:
+    _un._run = _un_run_orig
+    for _n, _v in _un_saved.items():
+        setattr(_un, _n, _v)
+
 # ---------------------------------------------------------------- teardown
 stop_reader.set()
 stop3.set()
