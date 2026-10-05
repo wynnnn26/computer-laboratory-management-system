@@ -1526,6 +1526,7 @@ check("attendance feature removed server-side",
 stop_reader = threading.Event()
 share_frames = []    # screen-share payloads the fake PC received (no acks)
 share_stops = []     # every CMD_SCREEN_SHARE_STOP the fake PC received
+roster_pings = []    # M2: cmd_roster_refresh nudges the fake PC received
 def client_loop():
     while not stop_reader.is_set():
         msg = w.recv_message(timeout=0.3)
@@ -1534,6 +1535,9 @@ def client_loop():
                 w.sock.getpeername(); continue
             except Exception:
                 break
+        if msg.type == MessageType.CMD_ROSTER_REFRESH.value:
+            roster_pings.append(msg)            # fire-and-forget: no ack
+            continue
         if msg.type == MessageType.CMD_SCREEN_SHARE_FRAME.value:
             share_frames.append(msg.payload)   # content: never acked
             continue
@@ -1567,6 +1571,55 @@ check("unlock clears desired state", row and not row["admin_state"],
       str(row and row["admin_state"]))
 res = srv.lock_client("GONE-PC", admin="tester")
 check("offline target rejected", res.get("success") is False)
+# M1: unlock-all releases every PC - an offline target's persisted
+# desired lock is cleared too, so a disconnected locked kiosk cannot
+# re-lock itself on reconnect (forgetting needs no link).
+srv.clients["TEST-PC"].is_online = False
+srv._save_desired("TEST-PC", {"cmd": "lock", "params": {}})
+res = srv.bulk_command("unlock", ["TEST-PC"], admin_user="tester")
+check("M1: offline PC unlock reports OFFLINE honestly",
+      res.get("TEST-PC", {}).get("result") == "OFFLINE", str(res))
+row = database.get_connection().execute(
+    "SELECT admin_state FROM computers WHERE pc_name='TEST-PC'").fetchone()
+check("M1: offline PC's persisted lock is cleared by unlock-all",
+      row is not None and not row["admin_state"],
+      str(row and row["admin_state"]))
+srv.clients["TEST-PC"].is_online = True
+
+# --- M2: a password change reaches every ONLINE Client PC at once ----------
+class _AuthEntry:
+    """Authenticated client stand-in for _on_password_change."""
+    authenticated = True
+    auth_user = "fresh01"
+    pc_name = "PW-TEST"
+    ip = "127.0.0.1"
+    must_change_password = False
+    def __init__(self):
+        self.replies = []
+    def send(self, msg):
+        self.replies.append(msg)
+        return True
+
+_pw_entry = _AuthEntry()
+_n_before = len(roster_pings)
+srv._on_password_change(_pw_entry, {"new_password": "M2pass99"})
+check("M2: password change accepted for the authenticated account",
+      any(m.payload.get("success") is True for m in _pw_entry.replies),
+      str([(m.type, m.payload) for m in _pw_entry.replies]))
+_row = database.get_connection().execute(
+    "SELECT password FROM users WHERE student_id='fresh01'").fetchone()
+check("M2: the new password is stored as a salted hash",
+      _row is not None and database.verify_password("M2pass99",
+                                                    _row["password"]),
+      str(bool(_row)))
+for _ in range(40):
+    if len(roster_pings) > _n_before:
+        break
+    time.sleep(0.05)
+check("M2: the change pushes a roster refresh to online Client PCs",
+      len(roster_pings) > _n_before,
+      f"{_n_before}->{len(roster_pings)}")
+
 shot = srv.request_screenshot("TEST-PC", "tester")
 check("screenshot roundtrip", shot.get("success") and shot["data"]["image"] == "ZmFrZQ==")
 check("observe start works", srv.start_screen_observe(
@@ -1674,6 +1727,10 @@ for _ in range(40):                        # the STOP ack travels back async
 check("share STOP is audited and ack-resolved",
       row is not None and row["executed_at"] is not None,
       str(dict(row) if row else None))
+for _ in range(40):                        # the STOP fan-out is sequential:
+    if _dead.calls >= 3:                   # every target is attempted in
+        break                              # turn, TEST-PC's may land first
+    time.sleep(0.05)
 check("the dropped PC still gets its STOP attempt (audited honestly)",
       _dead.calls == 3, str(_dead.calls))
 res = srv.stop_screen_share("tester", role="admin")
@@ -1687,6 +1744,51 @@ check("no PC online -> the share refuses cleanly",
 srv.clients["TEST-PC"].is_online = True
 srv.clients.pop("LAGGY-PC", None)
 check("the helper PC is removed again", "LAGGY-PC" not in srv.clients)
+
+# Phase B: one PC blowing up mid-STOP (A-RAISER-PC sorts FIRST) must never
+# swallow the STOP of the PCs behind it - the finally loops per PC.
+class _RaiserEntry:
+    """Refuses frames like the dead PC, but raises on the STOP send."""
+    def __init__(self):
+        self.is_online = True
+        self.calls = 0
+        self.stops = 0
+    def send(self, msg):
+        self.calls += 1
+        if msg.type == MessageType.CMD_SCREEN_SHARE_STOP.value:
+            self.stops += 1
+            raise OSError("wedged peer died mid-STOP")
+        return False
+    def close(self):
+        pass
+
+_raiser = _RaiserEntry()
+srv.clients["A-RAISER-PC"] = _raiser
+share_stops.clear()
+share_frames.clear()                       # a NEW frame proves fan-out ran
+res = srv.start_screen_share("tester", role="admin")
+check("the second share starts with the wedged PC refused",
+      res.get("success") is True
+      and "A-RAISER-PC" not in (res.get("pcs") or []), str(res))
+for _ in range(40):                        # up to 2 s for >= 1 frame
+    if len(share_frames) >= 1:
+        break
+    time.sleep(0.05)
+srv.stop_screen_share("tester", role="admin")
+for _ in range(40):                        # worker exit: STOP delivery
+    if share_stops:
+        break
+    time.sleep(0.05)
+_row_raiser = database.get_connection().execute(
+    "SELECT status FROM client_commands WHERE command_type="
+    "'cmd_screen_share_stop' AND target_pc='A-RAISER-PC' "
+    "ORDER BY id DESC LIMIT 1").fetchone()
+check("Phase B: a PC failing mid-STOP never swallows the others' STOP",
+      _raiser.stops >= 1 and len(share_stops) >= 1
+      and _row_raiser is not None,
+      f"raiser_stops={_raiser.stops} stops={len(share_stops)} "
+      f"raiser_row={dict(_row_raiser) if _row_raiser else None}")
+srv.clients.pop("A-RAISER-PC", None)
 
 # --- Task 5: remote mouse/keyboard control -------------------------------
 from protocol import sanitize_remote_events, build_remote_input
@@ -2536,8 +2638,15 @@ check("More group collapses again",
 
 # --- spec 5: inventory system - stats, actions, quantity math -------------
 from crud_frame import InventoryCRUDFrame
-inv = next((cf for cf in dash.pages["inventory"].winfo_children()
-            if isinstance(cf, InventoryCRUDFrame)), None)
+# the inventory page wraps its contents in a scrollable frame, so walk the
+# whole subtree (same approach as _all_button_texts) - not just direct kids
+inv, _stack = None, [dash.pages["inventory"]]
+while _stack and inv is None:
+    _c = _stack.pop()
+    if isinstance(_c, InventoryCRUDFrame):
+        inv = _c
+    else:
+        _stack.extend(_c.winfo_children())
 check("inventory page uses InventoryCRUDFrame", inv is not None)
 check("inventory stats strip has 6 tiles",
       inv is not None and len(getattr(inv, "stat_labels", {})) == 6
@@ -2701,7 +2810,34 @@ check("search shows the Search PCs... placeholder",
 check("toast notification helper", callable(dash.toast))
 check("controls disabled until a PC is selected",
       bool(dash._ctrl_btns) and all(str(b.cget("state")) == "disabled"
-                                    for b in dash._ctrl_btns))
+                                    for b in dash._ctrl_btns
+                                    if b not in dash._unlock_btns))
+# M1: Force Unlock is the one control that never waits for a selection.
+check("M1: Force Unlock enabled with no selection",
+      bool(dash._unlock_btns)
+      and all(str(b.cget("state")) == "normal" for b in dash._unlock_btns),
+      str([str(b.cget("state")) for b in dash._unlock_btns]))
+# M1: it ignores the selection entirely and targets every registered PC.
+_bulk_seen = {}
+_orig_bulk = dash._bulk
+dash._bulk = lambda action, pcs=None: _bulk_seen.update(action=action, pcs=pcs)
+dash._unlock()
+dash._bulk = _orig_bulk
+check("M1: Force Unlock targets every PC with no selection",
+      _bulk_seen.get("action") == "unlock"
+      and _bulk_seen.get("pcs")
+      and _bulk_seen.get("pcs") == [str(s.get("pc_name"))
+                                    for s in dash._pc_states()
+                                    if str(s.get("pc_name", ""))],
+      str(_bulk_seen))
+# M2: an admin password edit must ask the Server for a roster push.
+_m2_notify = []
+_orig_notify = srv.notify_roster_changed
+srv.notify_roster_changed = lambda: _m2_notify.append(1) or {"sent": 1}
+dash._on_account_change("password", {"student_id": "admin"})
+srv.notify_roster_changed = _orig_notify
+check("M2: account password changes trigger a roster push",
+      len(_m2_notify) == 1, str(_m2_notify))
 # close button must minimize, never log out / destroy (Phase E)
 script = root.tk.call("wm", "protocol", dash._w, "WM_DELETE_WINDOW")
 root.tk.call(script)
@@ -3911,7 +4047,10 @@ dash._update_selection_ui()
 dash._clear_selection()
 check("clear empties the selection and disables controls",
       not dash._selected_pcs
-      and all(str(b.cget("state")) == "disabled" for b in dash._ctrl_btns))
+      and all(str(b.cget("state")) == "disabled" for b in dash._ctrl_btns
+              if b not in dash._unlock_btns)
+      and all(str(b.cget("state")) == "normal" for b in dash._unlock_btns),
+      str([str(b.cget("state")) for b in dash._unlock_btns]))
 
 # ---- Restart / Shutdown: explicit confirmation, never auto-trigger ------
 # _restart() and _shutdown() both funnel through _bulk(), which asks the

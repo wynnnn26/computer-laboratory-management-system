@@ -269,10 +269,10 @@ def desktop_dir() -> str:
 class HotkeyBlocker:
     """Low-level keyboard hook (Windows) that swallows dangerous hotkeys.
 
-    It also RAISES the P1-5 panic stop (Ctrl+Shift+Alt+K): the kiosk can
-    lose focus to another window, so an emergency chord cannot depend on
-    a Tk binding alone.  That path deliberately does not swallow the key
-    - both deliveries are allowed because `_panic_stop` is idempotent.
+    It also RAISES the hidden emergency stop (the stop chord): the kiosk
+    can lose focus to another window, so an emergency chord cannot depend
+    on a Tk binding alone.  That path deliberately does not swallow the
+    key - both deliveries are allowed because `_panic_stop` is idempotent.
     """
 
     _VK_LWIN, _VK_RWIN = 0x5B, 0x5C
@@ -291,7 +291,7 @@ class HotkeyBlocker:
         self._tid = None
         self._ready = threading.Event()
         # P1-5: zero-argument callback, invoked from the HOOK THREAD when
-        # Ctrl+Shift+Alt+K is seen.  The owner must marshal it to Tk.
+        # the stop chord is seen.  The owner must marshal it to Tk.
         self.on_panic = on_panic
 
     def _key_down(self, vk):
@@ -1145,15 +1145,16 @@ class ClientApp(ctk.CTk):
         # works even while the keyboard hook is active.
         self.bind_all("<Control-Shift-Alt-M>", self._emergency_force_unlock)
 
-        # P1-5 panic stop: Ctrl+Shift+Alt+K ends the session and locks the
-        # PC immediately - the exact counterpart to M above, and a different
-        # key so the two can never be confused.  M works as a plain Tk
-        # binding because the LOCKED kiosk is mapped and focused.  K is the
-        # opposite case: while a session runs the kiosk is WITHDRAWN, so a
-        # Tk binding would never see the chord - the global keyboard hook in
-        # HotkeyBlocker is what actually delivers it (_panic_from_hook).
-        # This binding is the belt-and-braces copy; _panic_stop acts only
-        # once, so double delivery is harmless.
+        # Hidden emergency stop: the stop chord stops client.exe outright
+        # (watchdogs and Run entry removed, then exit) from ANY state -
+        # a different key from M above so the two can never be confused.
+        # M works as a plain Tk binding because the LOCKED kiosk is mapped
+        # and focused.  The stop chord is the opposite case: while a
+        # session runs the kiosk is WITHDRAWN, so a Tk binding would never
+        # see it - the global keyboard hook in HotkeyBlocker is what
+        # actually delivers it (_panic_from_hook).  This binding is the
+        # belt-and-braces copy; _panic_stop acts only once, so double
+        # delivery is harmless.
         self.bind_all("<Control-Shift-Alt-K>", self._panic_stop)
 
         # start networking (server IP is saved once and reused automatically)
@@ -2361,11 +2362,15 @@ class ClientApp(ctk.CTk):
         return "break"
 
     def _panic_stop(self, event=None):
-        """P1-5 emergency hotkey: Ctrl+Shift+Alt+K stops everything now.
+        """Hidden emergency stop: the chord stops client.exe entirely.
 
-        The counterpart to the Ctrl+Shift+Alt+M force-unlock: where M
-        rescues a locked kiosk, K immediately ends the running session
-        and locks the PC.
+        Fires from ANY kiosk state (session, login, admin lock, pause):
+        audit locally first, tear down every live stream (observation /
+        share / remote), end the session if one is running, then drop
+        BOTH watchdog tasks and the startup Run entry - so the
+        every-minute watchdog cannot relaunch the kiosk - and exit.
+        Starting client.exe again by hand re-registers everything (the
+        normal startup path).
 
         Deliberately local-first - it never waits for the Server, so it
         keeps working with the Server offline.  The audit row goes into
@@ -2373,29 +2378,51 @@ class ClientApp(ctk.CTk):
         activity log is only sent when the link is up, because `net.send`
         is fire-and-forget and returns False while disconnected.
 
-        A no-op when there is nothing to stop: while a pause is in force
-        only an admin's Resume releases it (Phase B/#6), and an already
-        locked kiosk (login or admin lock) has no session to end.  That
-        also keeps M and K on opposite sides of the same state machine,
-        so neither can undo the other.
+        Idempotent: the first delivery wins and schedules the exit;
+        every later delivery (Tk binding AND hook both firing) is a
+        no-op.  The chord itself is an undocumented feature, so neither
+        the log strings nor the activity details spell it out.
         """
-        if self.state != self.STATE_UNLOCKED:
-            return
+        if getattr(self, "_panic_exiting", False):
+            return "break"
+        self._panic_exiting = True
         u = self.user or {}
         local_store.log_event(
-            "WARN", "safety", "Panic stop activated",
-            "Ctrl+Shift+Alt+K pressed at the kiosk - session stopped and "
-            "PC locked immediately", str(u.get("student_id", "")))
+            "WARN", "safety", "Emergency stop activated",
+            "Emergency stop chord pressed at the kiosk - client stopping, "
+            "watchdogs removed", str(u.get("student_id", "")))
         if self.net.connected:
             self.net.send(build_activity_log(
                 admin_user=str(u.get("student_id", "") or "-"),
                 action="panic_stop", target=self.net.pc_name,
-                details="Ctrl+Shift+Alt+K - session stopped and PC locked"))
-        self.stop_observation()      # never keep streaming after a panic
-        self._share_close("panic stop")   # never cover the PC after a panic
+                details="Emergency stop - client stopped, watchdogs removed"))
+        self.stop_observation()      # never keep streaming after a stop
+        self._share_close("panic stop")   # never cover the PC after a stop
         self._remote_stop_now("panic stop")   # never stay under remote control
-        self.user_logout("Panic stop (Ctrl+Shift+Alt+K)")
+        if self.user:
+            self.user_logout("Panic stop")
+        # Full stop: remove BOTH watchdog tasks and the startup Run entry
+        # BEFORE leaving - the every-minute tick would relaunch us within
+        # 60 s and the Run entry at the next logon.
+        try:
+            remove_watchdog()
+        except Exception:
+            pass
+        try:
+            remove_startup_registration()
+        except Exception:
+            pass
+        self.after(50, self._panic_exit)
         return "break"
+
+    def _panic_exit(self):
+        """Leave the Tk loop for good: mainloop() returns, the finally
+        block stops the tray icon and the process ends.  Its own method
+        so tests can stub the exit and still assert everything around it."""
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     def _panic_from_hook(self):
         """P1-5: called from the keyboard-hook thread - marshal onto Tk.
@@ -2580,6 +2607,17 @@ class ClientApp(ctk.CTk):
                 self._show_lock("Unlocked by administrator — please log in.",
                                 error=False)
                 self._send_cmd_response(cid, True, result="login_allowed")
+
+        elif t == MessageType.CMD_ROSTER_REFRESH.value:
+            # M2: the Server nudges after any account change (password
+            # edit, new account, revocation) - re-pull the roster now so
+            # the offline-login cache matches at once; the 6-hour
+            # refresh stays as the backstop.  Fire-and-forget: no ack
+            # unless a command_id ever rides along.
+            threading.Thread(target=self._sync_auth_roster, daemon=True,
+                             name="roster-refresh").start()
+            if cid:
+                self._send_cmd_response(cid, True)
 
         elif t == MessageType.CMD_LOGOUT.value:
             self.user_logout("Remote logout by administrator")
@@ -2882,6 +2920,13 @@ class ClientApp(ctk.CTk):
             self._share_win = win
             self._share_last = time.time()
             win.after(1000, self._share_tick)
+            # Phase A: while the overlay covers the PC the bypass-key
+            # blocker runs too (nobody alt-tabs out of the class screen).
+            # Remember whether WE are the ones arming it, so the close
+            # hands the hotkeys back exactly as they were.
+            self._share_hotkeys = not self.hotkeys.active
+            if self._share_hotkeys:
+                self.hotkeys.start()
             local_store.log_event(
                 "INFO", "share", "Screen share shown",
                 f"admin={admin or '-'} "
@@ -2909,7 +2954,7 @@ class ClientApp(ctk.CTk):
             return                      # hostile/Corrupt: never decode it
         if not self._share_open():
             return
-        from PIL import Image, ImageTk
+        from PIL import Image
         raw = base64.b64decode(img_b64)
         img = Image.open(io.BytesIO(raw))
         img.load()                      # decode now - a bad frame fails HERE
@@ -2920,7 +2965,7 @@ class ClientApp(ctk.CTk):
         if img.width > sw or img.height > sh:
             resample = getattr(Image, "Resampling", Image)
             img.thumbnail((sw, sh), resample.LANCZOS)
-        photo = ImageTk.PhotoImage(img)
+        photo = ctk.CTkImage(light_image=img, size=(img.width, img.height))
         win.label.configure(image=photo, text="")
         win.label.image = photo          # keep a reference
         self._share_last = time.time()
@@ -2940,6 +2985,14 @@ class ClientApp(ctk.CTk):
             pass
         local_store.log_event("INFO", "share", "Screen share closed",
                               f"reason={reason}")
+        # Phase A: hand the hotkeys back as they were - stop the blocker
+        # only if THIS share armed it, and only while the kiosk is
+        # unlocked.  A login/lock/pause screen reached mid-share keeps
+        # its blocker (those states arm it themselves).
+        if getattr(self, "_share_hotkeys", False):
+            self._share_hotkeys = False
+            if self.state == self.STATE_UNLOCKED:
+                self.hotkeys.stop()
 
     def _share_tick(self):
         """1 s heartbeat: close the overlay when frames stop for 5 s, so a

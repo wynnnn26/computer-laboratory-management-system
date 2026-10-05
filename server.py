@@ -961,6 +961,28 @@ class LabServer:
                            "Default password replaced with a new password",
                            entry.ip)
         entry.send(build_password_change_response(True))
+        # M2: every online Client PC re-pulls the roster at once, so the
+        # new password applies to Client PCs immediately - including what
+        # an offline sign-in will accept (6-hour pull is the backstop).
+        self.notify_roster_changed()
+
+    def notify_roster_changed(self):
+        """M2: tell every ONLINE Client PC that accounts changed (password
+        edit, new account, revocation) so it re-pulls the auth roster now.
+        Fire-and-forget: no command_id, no audit row - the pull is the
+        proof.  Offline PCs catch up on their next reconnect/refresh."""
+        from protocol import Message, MessageType
+        sent = 0
+        with self.clients_lock:
+            entries = [e for e in self.clients.values() if e and e.is_online]
+        for e in entries:
+            try:
+                if e.send(Message.create(
+                        MessageType.CMD_ROSTER_REFRESH, {})):
+                    sent += 1
+            except Exception:
+                pass        # raced with a disconnect: the pull covers it
+        return {"sent": sent}
 
     # ----------------------------------------------------------- sessions
     def _on_session_start(self, entry, p):
@@ -1394,6 +1416,12 @@ class LabServer:
         for pc in [str(x) for x in (pc_names or [])]:
             entry = self.get_client(pc)
             if not entry or not entry.is_online:
+                if cmd == MessageType.CMD_UNLOCK:
+                    # M1: force unlock releases every PC - clear the
+                    # persisted desired lock even while offline, so a
+                    # disconnected locked kiosk cannot re-lock itself on
+                    # reconnect (forgetting the intent needs no link).
+                    self._save_desired(pc, None)
                 results[pc] = {"success": False, "result": "OFFLINE",
                                "error": f"{pc} is offline"}
             else:
@@ -2137,16 +2165,22 @@ class LabServer:
             with self.clients_lock:
                 names = [n for n in self.share_targets
                          if n in self.clients and self.clients[n].is_online]
-            for name in names:
-                entry = self.clients.get(name)
-                if not entry:
+            # Phase B: sorted so delivery order is deterministic, and one
+            # PC per try/except - a wedged peer or a transient audit error
+            # must never swallow the STOP of every PC behind it.
+            for name in sorted(names):
+                try:
+                    entry = self.clients.get(name)
+                    if not entry:
+                        continue
+                    command_id = self._audit_command(
+                        name, "cmd_screen_share_stop", {}, admin, status="Sent")
+                    msg = build_screen_share_stop()
+                    msg.payload["command_id"] = command_id
+                    if not entry.send(msg):
+                        self._audit_done(command_id, False, "send failed")
+                except Exception:
                     continue
-                command_id = self._audit_command(
-                    name, "cmd_screen_share_stop", {}, admin, status="Sent")
-                msg = build_screen_share_stop()
-                msg.payload["command_id"] = command_id
-                if not entry.send(msg):
-                    self._audit_done(command_id, False, "send failed")
             self._log_activity(admin or "-", "screen_share_stop",
                                f"{len(names)} PCs", "share ended")
 

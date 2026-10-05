@@ -176,7 +176,7 @@ ORANGE = "#dc6803"           # logout / low stock
 PURPLE = "#8b5cf6"           # restart
 CRIMSON = "#be123c"          # shutdown
 SKY = "#0ea5e9"              # live observation
-ONLINE = "#1fc65d"           # connected / online
+ONLINE = "#16a34a"           # connected / online (>=3:1 as chip text on white)
 
 # ==========================================================================
 # 4. Text + borders
@@ -288,10 +288,10 @@ STATUS_COLORS = {
     "online": ONLINE,            # green
     "offline": "#e42313",        # red
     "in_use": "#1e7ef0",         # blue
-    "paused": "#f5b301",         # yellow / orange
+    "paused": "#b45309",         # yellow / orange (darkened for white chips)
     "locked": "#8b33d9",         # purple
-    "available": "#9aa1ae",      # gray
-    "verifying": "#16c4c4",      # cyan
+    "available": "#6b7280",      # gray
+    "verifying": "#0e7490",      # cyan
     "unknown": "#3a3a3a",        # dark gray (fallback)
 }
 STATUS_ORDER = ["online", "offline", "in_use", "paused", "locked",

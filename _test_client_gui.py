@@ -17,9 +17,9 @@ except Exception:
     pass
 
 # --- safety: no keyboard hook, no server-IP dialog ever -------------------
-client.HotkeyBlocker.start = lambda self: None
-client.HotkeyBlocker.stop = lambda self: None
-client.HotkeyBlocker.shutdown = lambda self: None
+client.HotkeyBlocker.start = lambda self: setattr(self, "active", True)
+client.HotkeyBlocker.stop = lambda self: setattr(self, "active", False)
+client.HotkeyBlocker.shutdown = lambda self: setattr(self, "active", False)
 # ...but keep a handle on the REAL dialog first so the P0-2 block below can
 # open it deliberately (every other call in this suite stays a no-op).
 _real_ask_server_config = client.ClientApp.__dict__["_ask_server_config"]
@@ -323,6 +323,20 @@ app.update()
 check("[unlock] force login restores session",
       app.state == "unlocked" and bool(app.session_id))
 check("[unlock] kiosk hidden again", not app.winfo_viewable())
+
+# --- M1: force login with NO account on the machine - the kiosk lands on ---
+# --- the normal login screen (unlock never needs a user present).          ---
+app.user = None
+app.handle_command(Message.create(MessageType.CMD_LOCK,
+                                  {"params": {"message": "no-session"},
+                                   "command_id": "n1"}))
+app.update()
+check("[m1] locked with no session", app.state == "admin_lock", str(app.state))
+app.handle_command(Message.create(MessageType.CMD_UNLOCK, {"command_id": "n2"}))
+app.update()
+check("[m1] unlock with no session lands on the login screen",
+      app.state == "login" and app.winfo_viewable(),
+      f"{app.state} viewable={app.winfo_viewable()}")
 
 # --- re-login resumes the same session ------------------------------------
 old = app.session_id
@@ -926,6 +940,54 @@ check("[offline] non-roster account rejected",
       app.state == "login"
       and "No offline access" in app.msg_lbl.cget("text"),
       str(app.msg_lbl.cget("text")))
+# (d2) M2: an ADMIN account signs in offline too (the roster carries no
+# role filter), and a refreshed roster replaces the cached credential -
+# the old password dies, the new one works, still no server needed.
+_ls.cache_auth_roster([
+    {"student_id": "2023-00001", "full_name": "Juan Dela Cruz",
+     "role": "student",
+     "password_hash": _db.hash_password("student123"),
+     "status": "Active", "must_change_password": 0},
+    {"student_id": "admin", "full_name": "Administrator",
+     "role": "admin",
+     "password_hash": _db.hash_password("oldpass99"),
+     "status": "Active", "must_change_password": 0}], 7)
+app.id_var.set("admin"); app.pw_var.set("oldpass99")
+app.attempt_login()
+app.update()
+check("[m2] admin account signs in offline (Local Mode)",
+      app.state == "unlocked" and getattr(app, "offline_session", False)
+      and bool(app.session_id),
+      f"{app.state} offline={getattr(app, 'offline_session', None)}")
+check("[m2] offline admin stays on the kiosk UI (no dashboard window)",
+      not app.winfo_viewable(), str(app.winfo_viewable()))
+app.user_logout("m2 offline admin reset")
+app.update()
+# the roster a Server push would write: same admin, new password hash
+_ls.cache_auth_roster([
+    {"student_id": "2023-00001", "full_name": "Juan Dela Cruz",
+     "role": "student",
+     "password_hash": _db.hash_password("student123"),
+     "status": "Active", "must_change_password": 0},
+    {"student_id": "admin", "full_name": "Administrator",
+     "role": "admin",
+     "password_hash": _db.hash_password("newpass88"),
+     "status": "Active", "must_change_password": 0}], 7)
+app.id_var.set("admin"); app.pw_var.set("oldpass99")
+app.attempt_login()
+app.update()
+check("[m2] the old admin password dies after the roster refresh",
+      app.state == "login"
+      and "Invalid ID or password" in app.msg_lbl.cget("text"),
+      str(app.msg_lbl.cget("text")))
+app.id_var.set("admin"); app.pw_var.set("newpass88")
+app.attempt_login()
+app.update()
+check("[m2] the changed password applies to the Client PC",
+      app.state == "unlocked" and getattr(app, "offline_session", False),
+      str(app.state))
+app.user_logout("m2 reset for (e)")
+app.update()
 # (e) a roster older than max_offline_days expires (item 12)
 _ls.cache_auth_roster([
     {"student_id": "2023-00001", "full_name": "Juan Dela Cruz",
@@ -1247,10 +1309,11 @@ app2.net.connected = False
 # restore the safety stub for anything that follows
 client.ClientApp._ask_server_config = lambda self: None
 
-# --- P1-5 panic stop: Ctrl+Shift+Alt+K ends the session and locks ---------
-check("[panic] Tk binding registered for Ctrl+Shift+Alt+K",
+# --- P1-5 hidden emergency stop: the stop chord stops client.exe ----------
+# The chord is an UNDOCUMENTED feature - the check names never spell it.
+check("[panic] Tk binding registered for the stop chord",
       bool(app2.bind_all("<Control-Shift-Alt-K>")))
-check("[panic] keyboard hook raises the panic stop too",
+check("[panic] keyboard hook raises the emergency stop too",
       app2.hotkeys.on_panic == app2._panic_from_hook)
 # drop anything earlier steps queued so it cannot interleave with this
 while True:
@@ -1258,6 +1321,25 @@ while True:
         app2.events.get_nowait()
     except Exception:
         break
+# stub everything destructive - the exit itself, watchdog-task removal
+# and the Run-entry removal - then assert exactly those were requested.
+_m3 = {"exit": 0, "wd": 0, "run": 0}
+_orig_rwd = client.remove_watchdog
+_orig_rsu = client.remove_startup_registration
+client.remove_watchdog = lambda: (_m3.__setitem__("wd", _m3["wd"] + 1), True)[1]
+client.remove_startup_registration = lambda: (
+    _m3.__setitem__("run", _m3["run"] + 1), True)[1]
+app2._panic_exit = lambda: _m3.__setitem__("exit", _m3["exit"] + 1)
+
+def _m3_fire():
+    """Fire the chord and let its scheduled exit timer run."""
+    app2._panic_stop()
+    _time.sleep(0.08)
+    app2.update()
+
+def _m3_reset():
+    app2._panic_exiting = False
+
 app2.user = {"student_id": "2023-00001", "full_name": "Juan Dela Cruz",
              "role": "student"}
 app2.session_id = "SESS-PANIC"
@@ -1272,31 +1354,38 @@ check("[panic] setup: a session is running and unlocked",
 # `event_generate` is NOT reliable here: while a session runs the kiosk is
 # WITHDRAWN and Tk silently drops the synthetic key - which is exactly why
 # the global keyboard hook (exercised further down) is the real path.
-app2._panic_stop()
-app2.update()
+_m3_fire()
 check("[panic] unlocked session is stopped and the PC locks",
       app2.state == "login" and app2.winfo_viewable(), str(app2.state))
-check("[panic] panic worked with the Server offline",
+check("[panic] stop worked with the Server offline",
       app2.net.connected is False and app2.session_id is None
       and app2.user is None,
       f"conn={app2.net.connected} sess={app2.session_id}")
-check("[panic] lock screen names the panic",
+check("[panic] lock screen names the stop",
       "Panic stop" in str(app2.msg_lbl.cget("text")),
       str(app2.msg_lbl.cget("text")))
-check("[panic] audited in the durable local store",
+check("[panic] audited durably, chord keys never logged",
       len([e for e in _ls.pending_logs(500)
-           if e.get("message") == "Panic stop activated"]) == 1)
+           if e.get("message") == "Emergency stop activated"]) == 1
+      and not any("Alt+K" in str(e.get("detail") or "")
+                  for e in _ls.pending_logs(500)))
+check("[panic] both watchdog tasks and the Run entry are dropped",
+      _m3["wd"] == 1 and _m3["run"] == 1, str(_m3))
+check("[panic] the exit was requested", _m3["exit"] == 1, str(_m3))
 # double delivery (Tk binding AND hook, both allowed to fire) must neither
-# double-log nor raise - this is what makes the two paths safe together.
+# double-log nor re-run the removals - the first delivery wins.
 app2._panic_stop()
 app2._panic_from_hook()
 app2._pump()
-check("[panic] repeat delivery while locked is a safe no-op",
-      app2.state == "login"
-      and len([e for e in _ls.pending_logs(500)
-               if e.get("message") == "Panic stop activated"]) == 1)
-# ...and the hook path must be able to perform the panic on its own, since
+_time.sleep(0.08)
+app2.update()
+check("[panic] repeat delivery is a safe no-op (idempotent)",
+      len([e for e in _ls.pending_logs(500)
+           if e.get("message") == "Emergency stop activated"]) == 1
+      and _m3 == {"exit": 1, "wd": 1, "run": 1}, str(_m3))
+# ...and the hook path must be able to perform the stop on its own, since
 # the kiosk has no focus at all while it is unlocked (hook is global).
+_m3_reset()
 app2.user = {"student_id": "2023-00001", "full_name": "Juan Dela Cruz",
              "role": "student"}
 app2.session_id = "SESS-PANIC-HOOK"
@@ -1307,13 +1396,18 @@ check("[panic] setup 2: session running again",
       app2.state == "unlocked", str(app2.state))
 app2._panic_from_hook()
 app2._pump()
-check("[panic] the keyboard-hook path stops the session too",
+_time.sleep(0.08)
+app2.update()
+check("[panic] the keyboard-hook path stops the client too",
       app2.state == "login" and app2.session_id is None
       and app2.user is None, str(app2.state))
-check("[panic] second panic is audited as well",
+check("[panic] second stop is audited as well",
       len([e for e in _ls.pending_logs(500)
-           if e.get("message") == "Panic stop activated"]) == 2)
-# an admin pause is admin-owned: only Resume releases it, never a hotkey
+           if e.get("message") == "Emergency stop activated"]) == 2
+      and _m3 == {"exit": 2, "wd": 2, "run": 2}, str(_m3))
+# M3: the chord is a kill switch - it fires from ANY state, including an
+# admin pause (previously the pause swallowed it entirely).
+_m3_reset()
 app2.user = {"student_id": "2023-00001", "full_name": "Juan Dela Cruz",
              "role": "student"}
 app2.session_id = "SESS-PANIC-2"
@@ -1324,20 +1418,28 @@ app2.handle_command(Message.create(MessageType.CMD_PAUSE,
                                    {"params": {"message": "panic test"},
                                     "command_id": "pz1"}))
 app2.update()
-app2._panic_from_hook()
-app2._pump()
-check("[panic] does NOT release an admin pause",
+check("[panic] setup 3: admin pause in force",
       app2.state == "paused" and app2.pause_win is not None,
       str(app2.state))
-app2.handle_command(Message.create(MessageType.CMD_RESUME,
-                                   {"command_id": "pz2"}))
+_m3_fire()
+check("[panic] the stop fires even while paused (kill switch)",
+      _m3 == {"exit": 3, "wd": 3, "run": 3} and app2.pause_win is None,
+      f"{_m3} pause_win={app2.pause_win}")
+# M3: and from the lock screen with nobody logged in at all.
+_m3_reset()
+app2.user = None
+app2.session_id = None
 app2.update()
-check("[panic] admin resume still works afterwards",
-      app2.state == "unlocked" and app2.pause_win is None, str(app2.state))
+_m3_fire()
+check("[panic] the stop fires from the lock screen too",
+      app2.state == "login" and _m3 == {"exit": 4, "wd": 4, "run": 4},
+      f"{_m3} state={app2.state}")
 # Ctrl+Shift+Alt+M is the opposite emergency and must be untouched
 check("[panic] the M rescue hotkey is still bound too",
       bool(app2.bind_all("<Control-Shift-Alt-M>")))
-# leave it locked, exactly as the rest of this suite expects
+# restore the real removal helpers and leave the suite's expected state
+client.remove_watchdog = _orig_rwd
+client.remove_startup_registration = _orig_rsu
 app2.user_logout("panic test cleanup")
 app2.update()
 check("[panic] cleanup returns to the lock screen",
@@ -1572,6 +1674,39 @@ app2._share_last = _time.time() - 10
 app2._share_tick()
 check("[share] frozen frames time the overlay out (no stale slide)",
       getattr(app2, "_share_win", None) is None)
+
+# --- Phase A: the bypass hotkeys are blocked WHILE the overlay covers the PC
+# setup: an unlocked kiosk has the blocker off (unlock stops it).
+app2.user = {"student_id": "2023-00001", "full_name": "Juan Dela Cruz",
+             "role": "student"}
+app2.session_id = "SESS-SHARE-HK"
+app2.session_start = _time.time()
+app2._unlock_ui()
+app2.update()
+app2.hotkeys.active = False             # make the setup deterministic
+app2._share_open("tester")
+check("[share-hk] opening the overlay arms the blocker",
+      app2.hotkeys.active is True
+      and getattr(app2, "_share_hotkeys", False) is True,
+      f"active={app2.hotkeys.active} "
+      f"flag={getattr(app2, '_share_hotkeys', None)}")
+app2._share_close("phase-a test")
+check("[share-hk] closing the overlay (still unlocked) restores it",
+      app2.hotkeys.active is False
+      and getattr(app2, "_share_hotkeys", False) is False,
+      f"active={app2.hotkeys.active}")
+# a lock screen reached MID-SHARE keeps the blocker the share armed
+app2._share_open("tester")
+app2._show_lock("phase-a lock", error=True)     # lock screen mid-share
+app2.update()
+app2._share_close("phase-a test locked")
+check("[share-hk] closing while locked leaves the blocker running",
+      app2.state == "login" and app2.hotkeys.active is True
+      and getattr(app2, "_share_hotkeys", False) is False,
+      f"{app2.state} active={app2.hotkeys.active}")
+# cleanup: back to the plain login screen the rest of the suite expects
+app2._show_lock("phase-a cleanup", error=False)
+app2.update()
 
 # --- P1-8 Remote control: a durable, honest record on the PC itself -------
 app2.net.connected = False            # worst case: the link is already down

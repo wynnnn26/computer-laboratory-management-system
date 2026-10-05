@@ -53,6 +53,11 @@ class MessageType(Enum):
     CMD_SEND_MESSAGE = "cmd_send_message"
     CMD_EXECUTE = "cmd_execute"
     CMD_WEB_FILTER = "cmd_web_filter"
+    # M2 (Server -> Client): "accounts changed" nudge - fire-and-forget,
+    # no command_id (never acked, no audit row).  The Client answers by
+    # re-pulling the auth roster, so the offline-login cache can never
+    # keep a password the Server no longer has.
+    CMD_ROSTER_REFRESH = "cmd_roster_refresh"
     # Single file push (Server -> Client): the client saves the payload on
     # its Desktop - documents/handouts only, executables are refused on
     # both ends.  CMD_EXECUTE above stays deliberately unhandled.

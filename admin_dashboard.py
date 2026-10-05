@@ -204,6 +204,7 @@ class AdminDashboard(ctk.CTkToplevel):
         self._sidebar_btns = {}
         self._toasts = []
         self._ctrl_btns = []
+        self._unlock_btns = []            # M1: Force Unlock never needs a selection
         self._sel_labels = []            # "Selected: N PCs" labels (both pages)
         self.detail_panels = []          # PC / Session details panels
         self._selected_pcs = []          # unified selection (tree + cards)
@@ -650,7 +651,7 @@ class AdminDashboard(ctk.CTkToplevel):
         self._sel_labels.append(cnt)
         ctk.CTkLabel(head,
                  text="Applies to every selected PC "
-                      "(click · Ctrl+Click · Ctrl+A)",
+                      "(Force Unlock: all PCs)",
                  font=FONT_SMALL, text_color=MUTED, fg_color=BG_LIGHT).pack(side="right")
         btnrow = ctk.CTkFrame(bulk, fg_color=BG_LIGHT)
         btnrow.pack(fill="x", pady=(3, 0))
@@ -669,14 +670,23 @@ class AdminDashboard(ctk.CTkToplevel):
                 ("\U0001f513 Force Unlock", "unlock", SUCCESS),
                 ("\U0001f504 Restart", "restart", PURPLE),
                 ("\u23fb Shutdown", "shutdown", CRIMSON)]):
+            # M1: Force Unlock is the one action that never waits for a
+            # selection - it releases every lab PC (see _unlock).
+            cmd = self._unlock if action == "unlock" \
+                else lambda a=action: self._bulk(a)
             b = ctk.CTkButton(btnrow, text=text,
                           width=btn_fnt.measure(text) + 11,
-                          command=lambda a=action: self._bulk(a),
+                          command=cmd,
                           fg_color=color, text_color="white", cursor="hand2",
                           font=("Segoe UI", 9, "bold"), 
+                          # disabled text must stay readable ON the colour
+                          # (the theme gray scored 1.1 against these fills)
+                          text_color_disabled="#000000",
                           state="disabled")
             b.grid(row=0, column=i, sticky="ew", padx=3)
             self._ctrl_btns.append(b)
+            if action == "unlock":
+                self._unlock_btns.append(b)
         for c in range(7):
             btnrow.columnconfigure(c, weight=1)
 
@@ -1187,6 +1197,13 @@ class AdminDashboard(ctk.CTkToplevel):
                 b.configure(state=state)
             except Exception:
                 pass
+        # M1: Force Unlock applies to every PC, so it stays enabled with
+        # an empty selection - it is the one control that never waits.
+        for b in self._unlock_btns:
+            try:
+                b.configure(state="normal")
+            except Exception:
+                pass
         # Task 5: Remote is the ONE control that can drive a machine, so it
         # never enables just because something is selected - it needs a
         # single PC AND that PC to be online.
@@ -1508,11 +1525,14 @@ class AdminDashboard(ctk.CTkToplevel):
             r, c = divmod(i, 5)
             b = ctk.CTkButton(btns, text=text, command=cmd, fg_color=color, text_color="white",
                           font=("Segoe UI", 9, "bold"),
+                          text_color_disabled="#000000",
                           cursor="hand2", state="disabled")
             b.grid(row=r, column=c, sticky="ew", padx=3, pady=3)
             self._ctrl_btns.append(b)
             if text.endswith("Remote"):
                 self._remote_btn = b
+            if text.endswith("Force Unlock"):
+                self._unlock_btns.append(b)
         for c in range(5):
             btns.columnconfigure(c, weight=1)
 
@@ -1537,7 +1557,7 @@ class AdminDashboard(ctk.CTkToplevel):
 
         self.client_status_lbl = ctk.CTkLabel(
             page, text="Select a client PC to enable the controls "
-                       "(Force Unlock = Admin Force Login; "
+                       "(Force Unlock = all PCs, no selection; "
                        "double-click for a screenshot).",
             font=FONT_BODY, text_color=SUBTLE, fg_color=BG_LIGHT, anchor="w")
         self.client_status_lbl.grid(row=4, column=0, sticky="ew",
@@ -2198,8 +2218,20 @@ class AdminDashboard(ctk.CTkToplevel):
         self._bulk("lock")
 
     def _unlock(self):
-        # Admin Force Login: restores the open session without credentials
-        self._bulk("unlock")
+        # M1: Admin Force Login releases EVERY lab PC - one click, no
+        # selection, and it works even where no user is logged in (force
+        # login just lands that kiosk on its login screen).  Offline PCs
+        # are targeted too: the Server clears their persisted lock so a
+        # disconnected kiosk cannot re-lock itself on reconnect.
+        if not self.server:
+            self.toast("Server not connected.", "warn")
+            return
+        names = [str(s.get("pc_name", "")) for s in self._pc_states()
+                 if str(s.get("pc_name", ""))]
+        if not names:
+            self.toast("No PCs registered yet.", "warn")
+            return
+        self._bulk("unlock", pcs=names)
 
     def _logout_client(self):
         self._bulk("logout")
@@ -2496,7 +2528,7 @@ class AdminDashboard(ctk.CTkToplevel):
         if not img_b64:
             return
         try:
-            from PIL import Image, ImageTk
+            from PIL import Image
             raw = base64.b64decode(img_b64)
             img = Image.open(io.BytesIO(raw))
             # scale the frame down only if it does not fit the viewer.
@@ -2518,7 +2550,8 @@ class AdminDashboard(ctk.CTkToplevel):
             if img.width > avail_w or img.height > avail_h:
                 resample = getattr(Image, "Resampling", Image)
                 img.thumbnail((avail_w, avail_h), resample.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
+            photo = ctk.CTkImage(light_image=img,
+                                 size=(img.width, img.height))
             win.label.configure(image=photo, text="")
             win.label.image = photo            # keep a reference
             if target is None and (pc_name or data.get("pc_name")):
@@ -2552,6 +2585,11 @@ class AdminDashboard(ctk.CTkToplevel):
             else:
                 self.toast(f"Account {action}: saved (no active sessions)",
                            "success")
+        elif action == "password":
+            # M2: the password dialog already showed its own feedback -
+            # no session teardown here; the roster push below is what
+            # makes the new password apply to every Client PC at once.
+            pass
         else:
             self.toast("Account created", "success")
         # Live-sync: push the change through the server event channel so
@@ -2562,6 +2600,12 @@ class AdminDashboard(ctk.CTkToplevel):
                 self.server._emit("account_changed",
                                   {"action": action,
                                    "student_id": sid_new or sid_old})
+            except Exception:
+                pass
+            # M2: tell every online Client PC to re-pull the auth roster,
+            # so an offline sign-in can never accept an old password.
+            try:
+                self.server.notify_roster_changed()
             except Exception:
                 pass
 
@@ -2947,14 +2991,21 @@ class AdminDashboard(ctk.CTkToplevel):
             {"name": "date_added", "label": "Date Added", "type": "entry"},
             {"name": "last_updated", "label": "Last Updated", "type": "entry"},
         ]
+        # The 11-field form + stats strip + full-height table ask 735px,
+        # but the content area only offers ~625px at the 1080x700 floor
+        # (the sweep's "inventory: overflow").  Only this page overflows,
+        # so let it scroll at its natural height instead of squeezing the
+        # table: fill="x" keeps the frame's requested height intact.
+        _inv_scroll = ctk.CTkScrollableFrame(page, fg_color=BG_LIGHT)
+        _inv_scroll.pack(fill="both", expand=True)
         self.inventory_frame = InventoryCRUDFrame(
-            page, table="inventory", fields=fields,
+            _inv_scroll, table="inventory", fields=fields,
             title="Computer Lab Inventory",
             search_field="item_name", notify=self.toast,
             defaults={"date_added": now_date, "last_updated": now_date,
                       "status": "AVAILABLE"},
         )
-        self.inventory_frame.pack(fill="both", expand=True)
+        self.inventory_frame.pack(fill="x")
 
     # ----------------------------------------------------------- borrow
     def _build_borrow_tab(self):

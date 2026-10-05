@@ -79,7 +79,7 @@ decides which one it is; nothing else needs to change.
 | Student UI | `student_dashboard.py` | Announcements / messages / borrowing (:38) |
 | Data bridge | `client_api.py` | Network-first fetches for the student UI with SQLite fallback (:17) |
 | UI framework | `components.py`, `theme.py`, `utils.py`, `crud_frame.py` | Shared widgets, design tokens, styling helpers, reusable CRUD tables/pages |
-| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py` | 548 + 262 + 50 checks, self-contained |
+| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py`, `_full_sweep.py`, `_contrast_all.py` (all via `gate.bat`) | 558 + 274 + 50 checks, self-contained |
 | Build | `build_exe.bat`, `requirements.txt` | PyInstaller onefile builds for both apps |
 | Assets | `assets/`, `pc_icons/`, `app_icon.ico` | Logo, 8 PC status icons, window icon |
 | Design docs | `design-system/lab-management-system/MASTER.md` | Token/component spec behind `theme.py` |
@@ -115,7 +115,7 @@ register → receive → reconnect with backoff); everything received is
 queued and executed on the Tk thread, so widgets are only ever touched
 there. `ClientApp` is the fullscreen login/pause/lock UI driven by the
 guarded `_KioskState` machine. Startup registers the HKCU Run entry and
-the two watchdog tasks; panic/disconnect/logout paths always stop
+the two watchdog tasks; shutdown/disconnect/logout paths always stop
 observation, remote input and the share overlay. Offline behaviour
 (auth roster, queued logs) is delegated to `local_store`.
 
@@ -209,16 +209,16 @@ audit database.
 Tooling (underscore = development only, never packaged by
 `build_exe.bat`):
 
-**`_test_integration.py`** — the 548-check end-to-end suite: boots a
+**`_test_integration.py`** — the 558-check end-to-end suite: boots a
 real `LabServer` on test port 18443 against a scripted fake TLS client,
 asserts on the real database, builds the dashboard, drives the screen
 share, and re-checks the guardrails, watchdog and uninstaller. Prints
 PASS/FAIL lines, exits non-zero on any failure.
 
-**`_test_client_gui.py`** — the 262-check kiosk suite: real
+**`_test_client_gui.py`** — the 274-check kiosk suite: real
 `ClientApp` instances with stubbed network, hotkeys and `_schtasks`;
 exercises the state machine, every command handler, offline login,
-panic paths and the screen-share overlay.
+the emergency-stop paths and the screen-share overlay.
 
 **`_probe_layout.py`** — responsive-layout probe: measures each page's
 content demand against its available height, the details-panel mapping
@@ -332,8 +332,12 @@ monotonic integer (§8).
    reachable until it succeeds (`server.py:915`).
 4. On success the client starts a session (`SESSION_START` → a
    `client_sessions` row) and stops it on logout/server-side end.
-5. **Offline login:** the server periodically pushes an auth roster
-   (`auth_roster` sync, `server.py:1178`) that the client caches in
+5. **Offline login:** the server pushes an auth roster (`auth_roster`
+   sync, `server.py:1178`) on connect and **re-pushes it after every
+   password/account change** (fire-and-forget `CMD_ROSTER_REFRESH`
+   from `notify_roster_changed`; the client syncs in a background
+   thread, with a 6-hour periodic push as backstop) that the client
+   caches in
    `lab_client.db.auth_cache`. If the server is unreachable, the kiosk
    verifies locally (`local_store.verify_offline_login` :309) as long as the
    roster is younger than `max_offline_days = 7`. All offline activity is
@@ -341,7 +345,10 @@ monotonic integer (§8).
 
 **Admin Lock is server-side:** once a PC is locked, typing credentials on
 the kiosk cannot release it — only an explicit Admin Unlock
-(`unlock_client` → `CMD_UNLOCK`) does (`server.py:1780`).
+(`unlock_client` → `CMD_UNLOCK`) does (`server.py:1780`). Force Unlock
+always targets **every** PC (the selection never narrows it); an OFFLINE
+PC's unlock is saved as its desired state (`_save_desired(pc, None)` on
+the `bulk_command` OFFLINE branch) and delivered when it reconnects.
 
 ---
 
@@ -379,7 +386,9 @@ de-duplicated by command id, timed out after `command_timeout = 30` s, and
 audited (`_audit_command` :1743). Convenience wrappers exist for lock,
 unlock, logout, restart, shutdown, pause, resume and message; `bulk_command`
 (:2352) fans out to many PCs and reports per-PC
-`SUCCESS / FAILED / OFFLINE / TIMEOUT`.
+`SUCCESS / FAILED / OFFLINE / TIMEOUT`. An OFFLINE PC's `CMD_UNLOCK`
+is remembered as desired state and re-delivered on reconnect; other
+offline bulk commands are not.
 
 ### 6.4 Privileged observation, remote control and screen share
 
@@ -419,10 +428,9 @@ so pages update live without polling the database.
 
 Single instance (named mutex) → Startup entry + **two watchdog tasks**
 (logon + every-minute, unelevated) → kiosk window → optional tray icon.
-Starting the *server* on the same machine deletes both tasks. Hotkeys:
+Starting the *server* on the same machine deletes both tasks. Hotkey:
 `Ctrl+Shift+Alt+M` emergency force-unlock (locked kiosk, server
-unreachable — never releases a Pause), `Ctrl+Shift+Alt+K` panic stop
-(unlocked kiosk → immediate logout + end observation/remote).
+unreachable — never releases a Pause).
 
 ### 7.2 Network thread (`ClientNetwork`, :416)
 
@@ -478,9 +486,15 @@ the PC flips into presentation mode before the first frame lands. Each
 `CMD_SCREEN_SHARE_FRAME` is size-capped, decoded and letterboxed into
 that window by `_share_frame` (:2897); a frame with no overlay reopens
 it, so a PC that reconnects mid-share catches up. `_share_close` (:2928)
-runs on STOP, on disconnect and on panic stop, and `_share_tick` (:2944)
+runs on STOP, on disconnect and on an emergency client stop, and `_share_tick` (:2944)
 (a 1 s heartbeat) closes the overlay once frames stop for 5 s — a dead
 Server can never leave a stale slide on the lab PC.
+
+While the share is up, `_share_open` arms a hotkey blocker (recording
+whether the Client's own hotkeys were idle first) so the kiosk's
+hotkeys cannot fire over the class; `_share_close` releases the
+blocker only if the share armed it, so a share that ends while the
+app holds its own hotkeys leaves them exactly as it found them.
 
 ---
 
@@ -521,7 +535,8 @@ Server can never leave a stale slide on the lab PC.
 ## 9. Database (`database.py`)
 
 Connection: `sqlite3.Row` rows, `PRAGMA foreign_keys=ON`,
-`journal_mode=WAL` (:31-36). Schema changes are handled by
+`journal_mode=WAL` and a 15 s busy timeout (`timeout=15`, matching
+`local_store`) (:31-37). Schema changes are handled by
 `_migrate_legacy_schema` (:244), so old lab DBs upgrade in place.
 
 | Table | Holds |
@@ -592,13 +607,17 @@ EXE name, so distribution is "copy the file".
 ## 12. Testing and quality gate
 
 Three self-contained scripts (no pytest), each printing PASS/FAIL lines and
-exiting non-zero on any failure:
+exiting non-zero on any failure. `gate.bat` runs the whole gate in order
+— both suites on fresh DBs, then the two sweep tools — and stops at the
+first failing stage:
 
 | Suite | Checks | Covers |
 |---|---|---|
-| `_test_integration.py` | **548** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands, dashboard layout, role gating, Accounts bulk CSV upload, Send File desktop push, screen share (admin-gated fan-out, drop-on-slow, JPEG frames, ack-resolved START/STOP), guardrails, watchdog registration repair + self-heal, the standalone uninstaller (static + behavioural) |
-| `_test_client_gui.py` | **262** | kiosk state machine, lock/pause/logout, command de-dup, offline login + local queue, web policy ack, watchdog, hotkeys, observe clamps, Send File dispatch, screen-share overlay (open/paint/drop/rejoin/stop/timeout) |
+| `_test_integration.py` | **558** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands, dashboard layout, role gating, Accounts bulk CSV upload, Send File desktop push, screen share (admin-gated fan-out, drop-on-slow, JPEG frames, ack-resolved START/STOP), guardrails, watchdog registration repair + self-heal, the standalone uninstaller (static + behavioural), Force Unlock = all PCs (offline unlock remembered), roster refresh on password/account change |
+| `_test_client_gui.py` | **274** | kiosk state machine, lock/pause/logout, command de-dup, offline login + local queue, web policy ack, watchdog, hotkeys, observe clamps, Send File dispatch, screen-share overlay (open/paint/drop/rejoin/stop/timeout + hotkey arming), panic stop from any state |
 | `_probe_layout.py` | **50** | responsive layout at 1080×700 / 1280×780 / 1440×900 |
+| `_full_sweep.py` | — | every admin page at 3 sizes + hard resizes: fails on clipped captions, page overflow or children outside the window |
+| `_contrast_all.py` | — | pixel readability of every window (login, all admin pages, dialogs, student console): any heading below a 3.0 p99/p1 luminance ratio fails |
 
 Test ports: **TCP 18443**, **UDP 18444** (= 18443+1) — never the production
 defaults, so tests can run beside a live server. No manual setup is needed.

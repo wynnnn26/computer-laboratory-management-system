@@ -78,7 +78,8 @@ managing a school computer laboratory / internet café over a **LAN only**
   instead of stalling the class, and the STOP is delivered after the
   last frame on the same socket (TCP order), so no late frame can
   reopen a closed overlay. Each Client closes its overlay on STOP,
-  after a 5-second frame timeout, on disconnect and on panic stop.
+  after a 5-second frame timeout, on disconnect and on an emergency
+  client stop.
   It is **ADMINISTRATOR-only AT THE SERVER** (the same
   `_observe_role_ok` gate as Observe/Remote), the start/stop is
   audited per PC with the usual Sent → Done acknowledgement, and it
@@ -98,7 +99,9 @@ managing a school computer laboratory / internet café over a **LAN only**
 - **Pause never expires on its own** — it stays active until the admin
   explicitly presses Resume (and survives client/server restarts).
 - **Admin Lock cannot be bypassed by typing credentials**: only an
-  explicit Admin Unlock (force login) releases the PC.
+  explicit Admin Unlock (force login) releases the PC. Force Unlock
+  always targets **every** PC regardless of the current selection, and
+  an offline PC's unlock is remembered and applied when it reconnects.
 - **Emergency hotkey Ctrl+Shift+Alt+M**: a locked Client kiosk whose
   Server is unreachable can be force-unlocked locally - it reuses the
   normal force-unlock UI path (a still-open session is restored),
@@ -106,13 +109,6 @@ managing a school computer laboratory / internet café over a **LAN only**
   up (local-only when offline), never releases a Pause (only the
   admin's Resume does) and cannot bypass the server-enforced
   first-login password change.
-- **Panic stop hotkey Ctrl+Shift+Alt+K** — the opposite of the hotkey
-  above: an *unlocked* kiosk that must be secured on the spot stops
-  locally (screen observation ends, any active remote-control session is
-  disarmed and its held keys released, the user is logged out, the PC
-  returns to the login screen). It only ever acts while unlocked, never
-  releases an admin Pause, and records `panic_stop` in the server audit
-  trail whenever the link is up (local-only when offline).
 - **Client background + single instance:** the kiosk can be minimized
   to a notification-area (tray) icon with an *Open Dashboard* action,
   and a second launch of the same app re-opens the first one instead of
@@ -419,13 +415,6 @@ with.
   `client.exe`**, exports the local log to a CSV, deletes the client
   files (`client.exe`, `lab_client.db*`, `lab_config.json`) and finally
   deletes itself — each step reported honestly in a result dialog.
-- **Panic stop (Ctrl+Shift+Alt+K):** delivered by the same low-level
-  keyboard hook that swallows the bypass hotkeys, with a `bind_all`
-  fallback. It only ever acts while the kiosk is *unlocked*: screen
-  observation stops, the user is logged out through the normal logout
-  path, a local `Panic stop activated` entry is written and — when the
-  link is up — a `panic_stop` row lands in the server audit trail. It
-  never releases an admin Pause and does nothing on the lock screen.
 - **Screen observation + banner:** the server creates the observation
   audit row as *Sent* and only flips it to *Done* when the client
   actually acknowledges it (a target that is offline leaves it *Failed*
@@ -598,7 +587,7 @@ and the eight `pc_icons/*.png` status icons.
 ## Tests
 
 ```
-python _test_integration.py   # 548 checks: TLS framing, auth & role claim,
+python _test_integration.py   # 558 checks: TLS framing, auth & role claim,
                               # first-login password change (flagged
                               # accounts, sessions blocked until changed,
                               # hashed storage, audit rows),
@@ -710,8 +699,16 @@ python _test_integration.py   # 548 checks: TLS framing, auth & role claim,
                                # operator declines, every other bulk
                                # action stays a toast, and an unanswered
                                # disconnect is logged rather than turned
-                               # into a power action on its own
-python _test_client_gui.py    # 262 checks: kiosk state machine, admin lock,
+                               # into a power action on its own,
+                                # Force Unlock = ALL PCs always (the
+                                # selection never narrows it; an offline
+                                # PC's unlock is remembered and applied
+                                # when it reconnects), and roster refresh
+                                # on every password/account change
+                                # (server pushes fire-and-forget, the
+                                # client syncs in the background, a
+                                # 6-hour periodic push as backstop)
+python _test_client_gui.py    # 274 checks: kiosk state machine, admin lock,
                               # force login, pause, logout, command
                               # de-duplication, login card (password
                               # toggle, server line, PC footer),
@@ -731,7 +728,10 @@ python _test_client_gui.py    # 262 checks: kiosk state machine, admin lock,
                               # the kiosk falls back to the saved server_ip,
                               # [p1-4] watchdog task registration/removal +
                               # --watchdog conflict handling,
-                              # [p1-5] Ctrl+Shift+Alt+K panic stop,
+                              # [p1-5] hidden emergency stop chord (works
+                               # from ANY client state: audit first, release
+                               # observation/share/remote, log out, remove
+                               # the watchdog + startup tasks, exit once),
                               # [p1-6] Uninstall Client (role gate, CSV
                               # export, startup + watchdog removal),
                               # [observe] clamped stream parameters, exactly
@@ -751,7 +751,11 @@ python _test_client_gui.py    # 262 checks: kiosk state machine, admin lock,
                               # START, paints a frame, drops an oversized
                               # payload without decoding, reopens for a
                               # mid-share rejoin, closes on STOP and
-                              # times out once frames stop for 5 s
+                              # times out once frames stop for 5 s;
+                               # [share-hotkey] START arms the overlay's
+                               # hotkey blocker only when the app's own
+                               # hotkeys were idle, and release only drops
+                               # what the overlay armed
 python _probe_layout.py       # 50 checks: responsive layout probe -
                               # measures the Dashboard + Client PCs pages,
                               # the right-side details panel and the sidebar
@@ -767,7 +771,10 @@ Run them one after the other (the two server-backed suites target test
 port `18443`, UDP discovery `18444`). Each
 suite provisions what it needs (`init_db()` / a temporary
 `lab_config.json`) and leaves no server running — the source tree needs
-no manual setup first.
+no manual setup first. `gate.bat` runs the whole regression gate in one
+shot — both suites on fresh DBs, then `_full_sweep.py` (layout) and
+`_contrast_all.py` (pixel contrast) — and stops at the first failing
+stage.
 
 ## Project structure
 
@@ -877,11 +884,22 @@ lab_system/
 │                         pc_icons/ status icons, --collect-all
 │                         customtkinter for the dark UI; client.exe also
 │                         pulls in the pystray Windows backend)
-├── _test_integration.py  548-check end-to-end suite (server + protocol +
+├── _test_integration.py  558-check end-to-end suite (server + protocol +
 │                         admin dashboard)
-├── _test_client_gui.py   262-check kiosk state-machine suite
+├── _test_client_gui.py   274-check kiosk state-machine suite
 ├── _probe_layout.py      Responsive layout probe (no clipped rows or
 │                         panel overruns at min/default/large sizes)
+├── gate.bat              Regression gate: both suites (fresh DBs) +
+│                         layout sweep + contrast sweep, first failure
+│                         stops the run
+├── _full_sweep.py        Whole-UI layout sweep (every admin page at 3
+│                         sizes + hard resizes; clipped text or page
+│                         overflow fails)
+├── _contrast_all.py      Pixel contrast sweep (any heading under 3.0
+│                         luminance ratio fails; failing crops land in
+│                         _bad/)
+├── _ps_warm.py/_tail.py  Gate helpers (PowerShell warm-up, PASS/FAIL
+│                         log summary)
 ├── server.crt/server.key Auto-generated self-signed TLS certificate
 └── lab_system.db         Created automatically on first run (server only)
 ```
@@ -909,7 +927,11 @@ lab_system/
   `max_offline_days` (seeded `7`) of the last roster sync, and the
   hash must match. The cache is replaced wholesale on every roster
   sync, so disabling, deleting or changing an account on the Server
-  revokes its offline access as soon as the client syncs again.
+  revokes its offline access as soon as the client syncs again. A
+  sync is pushed right after any password/account change (the server
+  fires and forgets; the client refreshes in the background) with a
+  6-hour periodic push as backstop, so a changed password narrows the
+  offline window to minutes rather than days.
 - **Limitations of offline authentication** (accepted trade-offs,
   documented per spec):
   - credentials revoked or changed *after* the last roster sync stay
@@ -942,9 +964,7 @@ lab_system/
   and result - it shows both client events and server commands (with
   results). Every shutdown/restart is explicitly audited.
 - The keyboard hook is best-effort user-mode protection: it blocks common
-  bypass hotkeys while the kiosk is locked, and it is also what delivers
-  the **Ctrl+Shift+Alt+K** panic stop while the kiosk is *unlocked*
-  (it never fires on the lock screen). Ctrl+Alt+Del cannot be blocked
+  bypass hotkeys while the kiosk is locked. Ctrl+Alt+Del cannot be blocked
   by any user-mode software (by Windows design).
 
 ## Notes

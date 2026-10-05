@@ -29,7 +29,9 @@ def get_db_path():
 
 
 def get_connection():
-    conn = sqlite3.connect(get_db_path())
+    # timeout=15 -> busy handler waits 15s for a competing writer (WAL),
+    # matching local_store._connect_raw, instead of sqlite3's 5s default
+    conn = sqlite3.connect(get_db_path(), timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     # Enable WAL mode for better concurrency

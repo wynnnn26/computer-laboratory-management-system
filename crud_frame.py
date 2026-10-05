@@ -122,14 +122,14 @@ class CRUDFrame(ctk.CTkFrame):
 
         # ---- buttons ----
         btns = ctk.CTkFrame(self)
-        btns.pack(fill="x", padx=12, pady=(0, 6))
-        ctk.CTkButton(btns, text="Add New", command=self.add_record).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Update Selected", command=self.update_record).pack(side="left", padx=4)
+        btns.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkButton(btns, text="Add New", command=self.add_record).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="Update Selected", command=self.update_record).pack(side="left", padx=2)
         if self.allow_delete:
-            ctk.CTkButton(btns, text="Delete Selected", command=self.delete_record).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Clear Form", command=self.clear_form).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Refresh", command=self.refresh).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="Export to CSV", command=self.export_csv).pack(side="right", padx=4)
+            ctk.CTkButton(btns, text="Delete Selected", command=self.delete_record).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="Clear Form", command=self.clear_form).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="Refresh", command=self.refresh).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="Export to CSV", command=self.export_csv).pack(side="right", padx=2)
         # Keep a handle on the bar: subclasses add their own actions to it
         # (StaffAccountsFrame's "View Details", P2-9).
         self._btn_bar = btns
@@ -590,7 +590,7 @@ class InventoryCRUDFrame(CRUDFrame):
 
         # stock actions on the selected row (amount from the small entry)
         actions = ctk.CTkFrame(self)
-        actions.pack(fill="x", padx=12, pady=(0, 4))
+        actions.pack(fill="x", padx=10, pady=(0, 4))
         ctk.CTkLabel(actions, text="Stock actions:").pack(side="left")
         self.act_qty = tk.StringVar(value="1")
         ctk.CTkEntry(actions, textvariable=self.act_qty, width=36).pack(
@@ -601,7 +601,7 @@ class InventoryCRUDFrame(CRUDFrame):
                           ("Return Item", self.action_return),
                           ("Mark Damaged", self.action_damaged),
                           ("Mark Lost", self.action_lost)):
-            ctk.CTkButton(actions, text=text, command=cmd).pack(side="left", padx=2)
+            ctk.CTkButton(actions, text=text, command=cmd).pack(side="left", padx=1)
 
     # ------------------------------------------------------------- helpers
     @staticmethod
@@ -2701,6 +2701,12 @@ class StaffAccountsFrame(UserCRUDFrame):
         conn.close()
         self._close_password_dialog()
         self.refresh()
+        # M2: an admin password edit must reach every Client PC's offline
+        # roster cache - fire the same change hook row edits use, so the
+        # Server pushes a roster refresh to online Clients at once.
+        self._notify_change("password",
+                            {"student_id": row.get("student_id"),
+                             "full_name": row.get("full_name")})
         self._feedback(f"Password changed for "
                        f"{row.get('student_id') or row.get('full_name')}.",
                        "success")
