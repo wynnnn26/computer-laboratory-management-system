@@ -3261,7 +3261,11 @@ class ClientApp(ctk.CTk):
             try:
                 res = int(ctypes.windll.user32.VkKeyScanW(ord(ch)))
                 if res >= 0:
-                    return res & 0xFF, bool(res & 0x1000)
+                    # VkKeyScan: VK in the low byte, Shift in 0x100 - NOT
+                    # 0x1000 (the Kana flag). With the wrong mask every
+                    # shifted character was injected without Shift: A->a,
+                    # @->2, !->1 in a remote session.
+                    return res & 0xFF, bool(res & 0x100)
             except Exception:
                 pass
             if ch.isascii() and ch.isalnum():

@@ -608,7 +608,7 @@ and the eight `pc_icons/*.png` status icons.
 ## Tests
 
 ```
-python _test_integration.py   # 584 checks: TLS framing, auth & role claim,
+python _test_integration.py   # 588 checks: TLS framing, auth & role claim,
                               # first-login password change (flagged
                               # accounts, sessions blocked until changed,
                               # hashed storage, audit rows),
@@ -905,7 +905,7 @@ lab_system/
 │                         pc_icons/ status icons, --collect-all
 │                         customtkinter for the dark UI; client.exe also
 │                         pulls in the pystray Windows backend)
-├── _test_integration.py  584-check end-to-end suite (server + protocol +
+├── _test_integration.py  588-check end-to-end suite (server + protocol +
 │                         admin dashboard)
 ├── _test_client_gui.py   290-check kiosk state-machine suite
 ├── _probe_layout.py      Responsive layout probe (no clipped rows or

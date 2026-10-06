@@ -2516,6 +2516,21 @@ check("[remote] CTkImage pointer left of the picture is never forwarded",
       dash._remote_norm(_rw, _types.SimpleNamespace(
           x_root=_ox2 - 10, y_root=_oy2 + 5)) is None)
 _rw.destroy()
+# --- remote key translation: VkKeyScan puts Shift in 0x100, not Kana 0x1000 --
+# without the right mask _inject_key never holds Shift, so an admin's remote
+# typing lands as a / 2 / 1 on the lab PC.
+_vk, _sh = client_mod.ClientApp._vk_for("A", "A")
+check("[remote] 'A' needs Shift held (0x100, never Kana 0x1000)",
+      _sh is True and _vk == 0x41, f"{_vk},{_sh}")
+_vk, _sh = client_mod.ClientApp._vk_for("a", "a")
+check("[remote] 'a' needs no Shift", _sh is False and _vk == 0x41,
+      f"{_vk},{_sh}")
+_vk, _sh = client_mod.ClientApp._vk_for("at", "@")
+check("[remote] '@' needs Shift (types as 2 without it)",
+      _sh is True and _vk == 0x32, f"{_vk},{_sh}")
+_vk, _sh = client_mod.ClientApp._vk_for("F25", "")
+check("[remote] F25 has no Windows equivalent -> never injected",
+      _vk is None, f"{_vk},{_sh}")
 # --- spec 1: header keeps Logout, Minimize button removed -------------------
 def _is_button(w):
     """A pressable button.
