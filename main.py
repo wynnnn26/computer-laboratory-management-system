@@ -318,10 +318,12 @@ def run_server_mode():
     init_db()
     # P1-4: this machine runs the Server, so it is NOT a Client PC -
     # make sure no client watchdog task left behind by a previous run
-    # relaunches a kiosk on top of the Admin console.  Best effort.
+    # relaunches a kiosk on top of the Admin console, and hand Windows
+    # its normal Ctrl+Alt+Del back.  Best effort.
     try:
-        from client import remove_watchdog
+        from client import remove_watchdog, cad_policy_clear
         remove_watchdog()
+        cad_policy_clear()
     except Exception:
         pass
     events = queue.Queue()
@@ -347,9 +349,8 @@ def main():
     # P2: `--uninstall-startup` (any run style) removes the Windows
     # startup entry and exits without opening any UI.
     if "--uninstall-startup" in sys.argv:
-        from client import remove_startup_registration, remove_watchdog
-        remove_startup_registration()
-        remove_watchdog()
+        from client import uninstall_startup_work
+        uninstall_startup_work()
         return
 
     # Frozen server.exe / client.exe (and --server / --client) start

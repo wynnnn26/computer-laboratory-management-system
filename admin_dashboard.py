@@ -1935,7 +1935,20 @@ class AdminDashboard(ctk.CTkToplevel):
         try:
             iw, ih = int(photo.width()), int(photo.height())
         except Exception:
-            return None
+            # ctk.CTkImage has no width()/height() (a PIL PhotoImage
+            # does), and the AttributeError used to swallow every mouse
+            # event.  Ask the inner tk label for the photo it is actually
+            # drawing - same pixel space as winfo_width() - then fall
+            # back to the image's own logical size.
+            try:
+                inner = str(win.label._label.cget("image"))
+                iw = int(win.label._label.tk.call("image", "width", inner))
+                ih = int(win.label._label.tk.call("image", "height", inner))
+            except Exception:
+                try:
+                    iw, ih = int(photo._size[0]), int(photo._size[1])
+                except Exception:
+                    return None
         if iw <= 0 or ih <= 0:
             return None
         try:
@@ -2276,7 +2289,13 @@ class AdminDashboard(ctk.CTkToplevel):
             r = results[name] or {}
             kind = str(r.get("result") or "FAILED")
             counts[kind] = counts.get(kind, 0) + 1
-            extra = "" if kind == "SUCCESS" else f"  ({r.get('error') or ''})"
+            if kind == "SUCCESS":
+                # e.g. "PC1: SUCCESS  (login_allowed)" - the client's own
+                # ack makes an unlock's outcome visible per PC
+                detail = str(r.get("detail") or "")
+                extra = f"  ({detail})" if detail else ""
+            else:
+                extra = f"  ({r.get('error') or ''})"
             lines.append(f"  {name}: {kind}{extra}")
         summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
         lines.append(f"  \u2192 {summary}")

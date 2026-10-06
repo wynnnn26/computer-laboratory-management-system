@@ -32,6 +32,7 @@ decides which one it is; nothing else needs to change.
                                 │
 ┌───────────────────────────────┴──────────────── Lab PC  (client.exe / --client)┐
 │   run_client() ──► single-instance mutex · Startup entry · 2 watchdog tasks    │
+│        │  guard (--guard): watches every 2 s, relaunches a killed kiosk        │
 │        │                                                                       │
 │   ClientApp (fullscreen kiosk: login → locked / paused / unlocked / session)   │
 │        │                                                                       │
@@ -69,8 +70,8 @@ decides which one it is; nothing else needs to change.
 |---|---|---|
 | Entry / launcher | `main.py` | Mode detection (`_detected_mode` :35), server launcher (`run_server_mode` :316), `LoginWindow` (:126) |
 | Server core | `server.py` (2.4k lines) | `LabServer` (:210): accept loop, auth, heartbeats, commands, observe/remote, screen-share fan-out, website policy, audit |
-| Client core | `client.py` (4.1k lines) | `ClientApp` kiosk (:1057), `ClientNetwork` (:416), command handlers, share-screen overlay, watchdog/startup, offline mode |
-| Uninstaller | `uninstall.py`, `startup_ids.py` | Standalone `dist\uninstall.exe` (`--uac-admin`): watchdog tasks → Run entry → stop `client.exe` → export log CSV → delete client files → self-delete; `startup_ids.py` is the single source of the auto-start names both sides share |
+| Client core | `client.py` (4.3k lines) | `ClientApp` kiosk (:1146), `ClientNetwork` (:429), command handlers, share-screen overlay, watchdog/startup + guard process, CAD policy hardening, offline mode |
+| Uninstaller | `uninstall.py`, `startup_ids.py` | Standalone `dist\uninstall.exe` (`--uac-admin`): watchdog tasks → Run entry → CAD policy values → stop `client.exe` → export log CSV → delete client files → self-delete; `startup_ids.py` is the single source of the auto-start names AND the CAD policy values both sides share |
 | Wire protocol | `protocol.py` | `MessageType` enum (:19), `Message` framing (:126), TLS helpers (:251), self-signed cert generation (:269), message builders (:322-627) |
 | Server database | `database.py` | Schema (:58-241), migrations (:244), PBKDF2 hashing (:40), seeding + settings (:408-516) |
 | Client database | `local_store.py` | Offline log queue + auth roster cache (:64-384) |
@@ -79,7 +80,7 @@ decides which one it is; nothing else needs to change.
 | Student UI | `student_dashboard.py` | Announcements / messages / borrowing (:38) |
 | Data bridge | `client_api.py` | Network-first fetches for the student UI with SQLite fallback (:17) |
 | UI framework | `components.py`, `theme.py`, `utils.py`, `crud_frame.py` | Shared widgets, design tokens, styling helpers, reusable CRUD tables/pages |
-| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py`, `_full_sweep.py`, `_contrast_all.py` (all via `gate.bat`) | 558 + 274 + 50 checks, self-contained |
+| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py`, `_full_sweep.py`, `_contrast_all.py` (all via `gate.bat`) | 584 + 290 + 50 checks, self-contained |
 | Build | `build_exe.bat`, `requirements.txt` | PyInstaller onefile builds for both apps |
 | Assets | `assets/`, `pc_icons/`, `app_icon.ico` | Logo, 8 PC status icons, window icon |
 | Design docs | `design-system/lab-management-system/MASTER.md` | Token/component spec behind `theme.py` |
@@ -115,7 +116,10 @@ register → receive → reconnect with backoff); everything received is
 queued and executed on the Tk thread, so widgets are only ever touched
 there. `ClientApp` is the fullscreen login/pause/lock UI driven by the
 guarded `_KioskState` machine. Startup registers the HKCU Run entry and
-the two watchdog tasks; shutdown/disconnect/logout paths always stop
+the two watchdog tasks (honouring `auto_start: false` after an
+uninstall), spawns the `--guard` relaunch watcher, and applies/removes
+the HKCU Ctrl+Alt+Del policy values with every screen transition;
+shutdown/disconnect/logout paths always stop
 observation, remote input and the share overlay. Offline behaviour
 (auth roster, queued logs) is delegated to `local_store`.
 
@@ -209,13 +213,13 @@ audit database.
 Tooling (underscore = development only, never packaged by
 `build_exe.bat`):
 
-**`_test_integration.py`** — the 558-check end-to-end suite: boots a
+**`_test_integration.py`** — the 584-check end-to-end suite: boots a
 real `LabServer` on test port 18443 against a scripted fake TLS client,
 asserts on the real database, builds the dashboard, drives the screen
 share, and re-checks the guardrails, watchdog and uninstaller. Prints
 PASS/FAIL lines, exits non-zero on any failure.
 
-**`_test_client_gui.py`** — the 274-check kiosk suite: real
+**`_test_client_gui.py`** — the 290-check kiosk suite: real
 `ClientApp` instances with stubbed network, hotkeys and `_schtasks`;
 exercises the state machine, every command handler, offline login,
 the emergency-stop paths and the screen-share overlay.
@@ -252,8 +256,9 @@ This is why both EXEs are built from the same `main.py`.
 1. `database.init_db()` — creates/migrates SQLite, seeds default accounts
    (`admin/admin123`, `staff/staff123`, `2023-00001/student123`) and 13
    system settings.
-2. Removes leftover client watchdog tasks (a server PC must never open a
-   kiosk over the console).
+2. Removes leftover client watchdog tasks and clears the Ctrl+Alt+Del
+   restrictions (a server PC must never open a kiosk over the console,
+   and Windows there must be fully normal).
 3. `LabServer.start()` (`server.py:248`):
    - auto-generates `server.crt`/`server.key` if missing (`ensure_certificates`
      :118 — RSA-2048 self-signed, CN `LabSystem Server`, 10 years),
@@ -266,18 +271,32 @@ This is why both EXEs are built from the same `main.py`.
    `admin | staff | maintenance` → `AdminDashboard`, `student` →
    `StudentDashboard`. Tearing the window down stops the server.
 
-### 3.3 Client mode (`run_client`, `client.py:4064`)
+### 3.3 Client mode (`run_client`, `client.py`)
 
 1. `acquire_single_instance()` (:915) — named mutex
-   `Local\ComputerLaboratoryClient`; a second launch re-opens the first.
+   `Local\ComputerLaboratoryClient`; a second launch re-opens the first
+   (`--watchdog`/`--respawn` copies exit quietly, a human second copy is
+   told). A `--watchdog` tick may only start the kiosk while its own
+   scheduled task still exists — an in-flight tick whose task a panic
+   stop or uninstall already deleted never resurrects the kiosk.
 2. Registers two unelevated Windows scheduled tasks — one *at log on*, one
    *every minute* — that relaunch the kiosk if the process ever dies
-   (`register_watchdog` :3923, which also repairs a task whose stored
+   (`register_watchdog`, which also repairs a task whose stored
    command went stale or was deleted; a running kiosk re-verifies every
-   15 minutes via `_watchdog_heal_loop` :3956).
+   15 minutes via `_watchdog_heal_loop`). Both registration points
+   honour `auto_start: false` in `lab_config.json` — an uninstall
+   writes it, only a hand start clears it — so the self-heal can never
+   resurrect an uninstall.
 3. Builds `ClientApp` (fullscreen login card) and starts `ClientNetwork`
    with the address from `lab_config.json`, falling back to **UDP
-   discovery** if no address is stored (`discover_server_ip` :211).
+   discovery** if no address is stored (`discover_server_ip` :211), and
+   spawns the **guard process** (`--guard`, one per PC behind its own
+   mutex): a 2-second poll that relaunches a killed kiosk as
+   `--respawn` (Task Scheduler refuses any repetition below one minute)
+   and stands down as soon as the watchdog task disappears or
+   auto-start is switched off. `run_client`'s `finally` stops the
+   guard, clears the Ctrl+Alt+Del policies and frees the mutex — in
+   that order.
 
 ---
 
@@ -349,6 +368,10 @@ the kiosk cannot release it — only an explicit Admin Unlock
 always targets **every** PC (the selection never narrows it); an OFFLINE
 PC's unlock is saved as its desired state (`_save_desired(pc, None)` on
 the `bulk_command` OFFLINE branch) and delivered when it reconnects.
+The client's own ack rides along in every bulk result line —
+`PC1: SUCCESS  (force_login)` when a session was restored vs
+`(login_allowed)` when the PC simply landed on its login card — so an
+operator can tell the two outcomes apart per PC at a glance.
 
 ---
 
@@ -427,8 +450,12 @@ so pages update live without polling the database.
 ### 7.1 Process lifecycle
 
 Single instance (named mutex) → Startup entry + **two watchdog tasks**
-(logon + every-minute, unelevated) → kiosk window → optional tray icon.
-Starting the *server* on the same machine deletes both tasks. Hotkey:
+(logon + every-minute, unelevated) + **guard process** (2 s poll →
+`--respawn`) → kiosk window → optional tray icon. Every kiosk screen
+(login card, admin lock, pause overlay, share) also applies the HKCU
+Ctrl+Alt+Del restrictions; the bare desktop clears them, as do the
+panic stop, every uninstall path and Server mode. Starting the *server*
+on the same machine deletes both tasks. Hotkey:
 `Ctrl+Shift+Alt+M` emergency force-unlock (locked kiosk, server
 unreachable — never releases a Pause).
 
@@ -613,8 +640,8 @@ first failing stage:
 
 | Suite | Checks | Covers |
 |---|---|---|
-| `_test_integration.py` | **558** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands, dashboard layout, role gating, Accounts bulk CSV upload, Send File desktop push, screen share (admin-gated fan-out, drop-on-slow, JPEG frames, ack-resolved START/STOP), guardrails, watchdog registration repair + self-heal, the standalone uninstaller (static + behavioural), Force Unlock = all PCs (offline unlock remembered), roster refresh on password/account change |
-| `_test_client_gui.py` | **274** | kiosk state machine, lock/pause/logout, command de-dup, offline login + local queue, web policy ack, watchdog, hotkeys, observe clamps, Send File dispatch, screen-share overlay (open/paint/drop/rejoin/stop/timeout + hotkey arming), panic stop from any state |
+| `_test_integration.py` | **584** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands + client ack detail (`force_login` / `login_allowed`), dashboard layout, role gating, Accounts bulk CSV upload, Send File desktop push, screen share (admin-gated fan-out, drop-on-slow, JPEG frames, ack-resolved START/STOP), guardrails, watchdog registration repair + self-heal, the guard watcher (one cycle, respawn argv, single-mutex, task/flag stand-down, `--watchdog`/`--respawn` gates), CAD policy hardening (recorded registry writes, apply/clear/sync), the standalone uninstaller (static + behavioural), Force Unlock = all PCs (offline unlock remembered), roster refresh on password/account change |
+| `_test_client_gui.py` | **290** | kiosk state machine, lock/pause/logout, command de-dup, offline login + local queue, web policy ack, watchdog, hotkeys, observe clamps, Send File dispatch, screen-share overlay (open/paint/drop/rejoin/stop/timeout + hotkey arming), panic stop from any state, CAD policies follow every screen (login/unlock/pause/share/panic), login accepted after a no-session unlock, `auto_start` flag vs Run entry |
 | `_probe_layout.py` | **50** | responsive layout at 1080×700 / 1280×780 / 1440×900 |
 | `_full_sweep.py` | — | every admin page at 3 sizes + hard resizes: fails on clipped captions, page overflow or children outside the window |
 | `_contrast_all.py` | — | pixel readability of every window (login, all admin pages, dialogs, student console): any heading below a 3.0 p99/p1 luminance ratio fails |

@@ -140,6 +140,83 @@ def save_config(cfg):
         print(f"[CLIENT] Could not save config: {e}")
 
 
+def auto_start_enabled():
+    """False once an uninstall switched auto-start off (Bug 4): the
+    watchdog tasks, the Run entry and the guard then all stay away, so
+    an uninstall can never be healed back.  A hand start flips it on
+    again via set_auto_start(True).  Missing key / unreadable file
+    means enabled - a plain install must behave exactly as before."""
+    return load_config().get("auto_start", True) is not False
+
+
+def set_auto_start(enabled):
+    """Persist the auto-start flag; never raises (a kiosk start must not
+    fail because the config could not be written)."""
+    cfg = load_config()
+    cfg["auto_start"] = bool(enabled)
+    save_config(cfg)
+
+
+# ==========================================================================
+# Ctrl+Alt+Del policy hardening (Bug 2): while a kiosk screen is up -
+# login card, admin lock, pause overlay or screen share - every option
+# the Windows Ctrl+Alt+Del screen offers is policy-disabled for this
+# user; on the bare desktop the policies are gone and Windows is fully
+# normal again.  The CAD screen itself is Windows' secure desktop and
+# cannot be suppressed from user mode - dead options are the guarantee.
+# ==========================================================================
+from startup_ids import CAD_POLICY_VALUES
+
+
+def _reg_write(path, name, value):
+    """One HKCU DWORD write.  Best-effort: a refused write must never
+    break the kiosk (test suites swap this for a recorder)."""
+    try:
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+    except Exception as e:
+        print(f"[CLIENT] Policy write failed: {name}: {e}")
+
+
+def _reg_delete(path, name):
+    """One HKCU value removal; a missing value counts as success."""
+    try:
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                                winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, name)
+        except FileNotFoundError:
+            pass
+    except Exception as e:
+        print(f"[CLIENT] Policy delete failed: {name}: {e}")
+
+
+def cad_policy_apply():
+    """Harden every CAD option (kiosk screen showing).  Idempotent."""
+    for path, name in CAD_POLICY_VALUES:
+        _reg_write(path, name, 1)
+
+
+def cad_policy_clear():
+    """Back to a fully normal Windows (bare desktop, panic, uninstall,
+    Server mode).  Idempotent: missing values are the goal state."""
+    for path, name in CAD_POLICY_VALUES:
+        _reg_delete(path, name)
+
+
+def _cad_policy_sync(locked):
+    """Route a screen transition to apply/clear - the single place that
+    decides which of the two the current screen needs."""
+    if locked:
+        cad_policy_apply()
+    else:
+        cad_policy_clear()
+
+
+
 # ==========================================================================
 # System info (psutil)
 # ==========================================================================
@@ -909,7 +986,50 @@ def _startup_web_policy(saved_policy=None):
 # P0-1: one instance per PC + notification-area (system tray) presence
 # ==========================================================================
 SINGLE_INSTANCE_MUTEX = "Local\\ComputerLaboratoryClient"
+# The guard's own mutex: one guard process per PC (Bug 4).
+SINGLE_INSTANCE_MUTEX_GUARD = "Local\\ComputerLaboratoryClientGuard"
 _SINGLE_INSTANCE_HANDLE = None
+_GUARD_INSTANCE_HANDLE = None
+
+
+def _mutex_create(name):
+    """Create a named Windows mutex.  Returns (handle, already_exists);
+    (None, False) on any failure or non-Windows - every caller then
+    fails OPEN, because no mutex must ever block the kiosk or its
+    guard.  use_last_error=True + explicit prototypes: without them the
+    64-bit handle would be truncated to 32 bits and GetLastError would
+    report the wrong value."""
+    if platform.system() != "Windows":
+        return None, False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL,
+                                     wintypes.LPCWSTR)
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k32.CloseHandle.restype = wintypes.BOOL
+        handle = k32.CreateMutexW(None, False, name)
+        if not handle:
+            return None, False          # cannot tell - let it run
+        return handle, ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return None, False
+
+
+def _mutex_close(handle):
+    """Close one mutex handle.  Idempotent, never raises."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle(handle)
+        return True
+    except Exception:
+        return False
 
 
 def acquire_single_instance():
@@ -924,32 +1044,16 @@ def acquire_single_instance():
     (or a non-Windows platform) falls through to True.
     """
     global _SINGLE_INSTANCE_HANDLE
-    if platform.system() != "Windows":
-        return True
     if _SINGLE_INSTANCE_HANDLE is not None:
         return True
-    try:
-        import ctypes
-        from ctypes import wintypes
-        # use_last_error=True + explicit prototypes: without them the
-        # 64-bit handle would be truncated to 32 bits and GetLastError
-        # would report the wrong value.
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL,
-                                     wintypes.LPCWSTR)
-        k32.CreateMutexW.restype = wintypes.HANDLE
-        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        k32.CloseHandle.restype = wintypes.BOOL
-        handle = k32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
-        if not handle:
-            return True                    # cannot tell - let it run
-        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-            k32.CloseHandle(handle)
-            return False
-        _SINGLE_INSTANCE_HANDLE = handle
-        return True
-    except Exception:
-        return True
+    handle, exists = _mutex_create(SINGLE_INSTANCE_MUTEX)
+    if handle is None:
+        return True                    # cannot tell - let it run
+    if exists:
+        _mutex_close(handle)
+        return False
+    _SINGLE_INSTANCE_HANDLE = handle
+    return True
 
 
 def release_single_instance():
@@ -958,16 +1062,33 @@ def release_single_instance():
     handle, _SINGLE_INSTANCE_HANDLE = _SINGLE_INSTANCE_HANDLE, None
     if handle is None or platform.system() != "Windows":
         return False
-    try:
-        import ctypes
-        from ctypes import wintypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        k32.CloseHandle.restype = wintypes.BOOL
-        k32.CloseHandle(handle)
+    return _mutex_close(handle)
+
+
+def acquire_guard_instance():
+    """One guard process per PC - the guard's own mutex (Bug 4).  Same
+    fail-open contract as the kiosk mutex: never blocking beats never
+    guarded.  Returns True when this process now owns the mutex."""
+    global _GUARD_INSTANCE_HANDLE
+    if _GUARD_INSTANCE_HANDLE is not None:
         return True
-    except Exception:
+    handle, exists = _mutex_create(SINGLE_INSTANCE_MUTEX_GUARD)
+    if handle is None:
+        return True
+    if exists:
+        _mutex_close(handle)
         return False
+    _GUARD_INSTANCE_HANDLE = handle
+    return True
+
+
+def release_guard_instance():
+    """Free the guard mutex.  Idempotent, never raises."""
+    global _GUARD_INSTANCE_HANDLE
+    handle, _GUARD_INSTANCE_HANDLE = _GUARD_INSTANCE_HANDLE, None
+    if handle is None:
+        return False
+    return _mutex_close(handle)
 
 
 def _tray_logo(size=64):
@@ -1069,6 +1190,7 @@ class ClientApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.state = self.STATE_LOGIN
+        self._sync_cad()             # kiosk starts on its login card: harden
         self.events = queue.Queue()
         self.net = ClientNetwork(self.events)
         # P1-5: the keyboard hook raises the panic stop too, so it still
@@ -2266,6 +2388,18 @@ class ClientApp(ctk.CTk):
         ))
         self._unlock_ui()
 
+    def _sync_cad(self):
+        """Keep the Ctrl+Alt+Del policies in step with the screen showing:
+        harden while any kiosk screen is up (login card, admin lock,
+        pause overlay, screen share), clear them on the bare desktop.
+        Every screen transition calls this - the CURRENT state read here
+        decides, so overlaps (lock during a share, unlock from pause)
+        can never leave the policies on or off in the wrong direction."""
+        _cad_policy_sync(
+            self.state in (self.STATE_LOGIN, self.STATE_ADMIN_LOCK,
+                           self.STATE_PAUSED)
+            or getattr(self, "_share_win", None) is not None)
+
     def _unlock_ui(self):
         self.state = self.STATE_UNLOCKED
         self.lock_reason = ""
@@ -2292,6 +2426,7 @@ class ClientApp(ctk.CTk):
             elif not dbtn.winfo_ismapped():
                 dbtn.pack(side="right", padx=(6, 0))
         self._pulse_metrics()
+        self._sync_cad()                 # bare desktop: Windows fully normal
 
     def user_logout(self, reason=""):
         """End the session locally and return to the login screen."""
@@ -2332,6 +2467,7 @@ class ClientApp(ctk.CTk):
             self.grab_set()
         except Exception:
             pass
+        self._sync_cad()                 # login card up: harden CAD options
 
     def _emergency_force_unlock(self, event=None):
         """P1 emergency hotkey: Ctrl+Shift+Alt+M force-unlocks the kiosk.
@@ -2412,6 +2548,9 @@ class ClientApp(ctk.CTk):
             remove_startup_registration()
         except Exception:
             pass
+        # The PC becomes a normal Windows desktop again the moment we
+        # leave - never keep the CAD restrictions behind after a stop.
+        cad_policy_clear()
         self.after(50, self._panic_exit)
         return "break"
 
@@ -2473,6 +2612,7 @@ class ClientApp(ctk.CTk):
         self.pause_win.protocol("WM_DELETE_WINDOW", self._ignore_close)
         self.pause_win.grab_set()
         self.hotkeys.start()
+        self._sync_cad()                 # pause overlay up: harden CAD options
 
     def _close_pause_win(self):
         """Destroy the pause overlay if it exists (no UI state change)."""
@@ -2931,6 +3071,7 @@ class ClientApp(ctk.CTk):
                 "INFO", "share", "Screen share shown",
                 f"admin={admin or '-'} "
                 f"link={'up' if self.net.connected else 'down'}")
+            self._sync_cad()             # overlay up: harden CAD options
             return True
         except Exception:
             self._share_win = None
@@ -2993,6 +3134,7 @@ class ClientApp(ctk.CTk):
             self._share_hotkeys = False
             if self.state == self.STATE_UNLOCKED:
                 self.hotkeys.stop()
+        self._sync_cad()          # overlay gone: re-evaluate the screen
 
     def _share_tick(self):
         """1 s heartbeat: close the overlay when frames stop for 5 s, so a
@@ -3814,9 +3956,7 @@ from startup_ids import STARTUP_VALUE_NAME, STARTUP_KEY_PATH
 
 def _startup_command():
     """Command line that relaunches this client on Windows sign-in."""
-    if getattr(sys, "frozen", False):        # PyInstaller client.exe
-        return f'"{sys.executable}"'
-    return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+    return " ".join(f'"{a}"' for a in _startup_argv())
 
 
 def register_startup():
@@ -3825,8 +3965,12 @@ def register_startup():
     Rewriting the same name/value on every start is safe (that IS the
     idempotency) and keeps the entry correct after the folder moves.
     Never raises: a failed registration must not stop the kiosk.
+    A completed uninstall switches auto-start off, and this is the
+    single choke point that honours it (hand starts flip it back on).
     """
     if platform.system() != "Windows":
+        return False
+    if not auto_start_enabled():
         return False
     try:
         import winreg
@@ -3985,8 +4129,12 @@ def register_watchdog():
     Returns True when the repeating task is in place - that is the one
     that actually restarts a client that crashed, was closed or was
     killed in Task Manager (worst case a minute later, when its next
-    tick finds the single-instance mutex free)."""
+    tick finds the single-instance mutex free).
+    An uninstall switches auto-start off - honouring that HERE is what
+    stops the 15-minute self-heal loop from resurrecting the tasks."""
     if platform.system() != "Windows":
+        return False
+    if not auto_start_enabled():
         return False
     cmd = _watchdog_command()
     if not _task_matches(WATCHDOG_TASK_LOGON, cmd):
@@ -4048,16 +4196,131 @@ def _watchdog_conflict(argv=None):
     """P1-4 gate: is this process allowed to start the kiosk?
 
     "start"    - nothing holds the single-instance mutex, proceed;
-    "quiet"    - a scheduled `--watchdog` tick found the client already
-                 running: exit silently, that is not an error;
+    "quiet"    - a scheduled `--watchdog` tick or a guard `--respawn`
+                 found the client already running: exit silently, that
+                 is not an error;
     "conflict" - a human launched a second copy: tell them why nothing
                  opened.
     """
-    argv = list(sys.argv if argv is None else argv)
+    argv = [str(a).lower() for a in (sys.argv if argv is None else argv)]
+    quiet = any(a in ("--watchdog", "--respawn") for a in argv)
+    if not acquire_single_instance():
+        return "quiet" if quiet else "conflict"
+    # An in-flight watchdog tick whose task has since been deleted (panic
+    # stop, uninstall, Server mode) must not resurrect the kiosk: a real
+    # scheduled tick only ever comes FROM that task - no task, no start.
+    if "--watchdog" in argv and not _task_exists(WATCHDOG_TASK_REPEAT):
+        release_single_instance()
+        return "quiet"
+    return "start"
+
+
+# ==========================================================================
+# Relaunch guard (Bug 4): a tiny watcher the kiosk starts with itself.
+# Task Scheduler's minimum repeat interval is 1 minute (the service
+# refuses PT10S outright), so a Task Manager kill would expose the
+# desktop for up to 60 s - the guard closes that to ~2 s: while the
+# kiosk is down it starts it again as `--respawn`.  The every-minute
+# scheduled tick stays as the backstop (guard dead too, boot, ...).
+#
+# It stops itself when the watchdog task it mirrors disappears (panic
+# stop, uninstall, Server mode - all of them delete that task) or when
+# auto-start is switched off, so it can never undo any of them.
+# ==========================================================================
+GUARD_POLL_SECONDS = 2           # one cycle: flag + task + mutex + spawn
+_GUARD_TASK_EVERY = 5            # task-existence probe every Nth cycle
+_GUARD_BOOT_SECONDS = 15         # never stack respawns while one boots
+_GUARD_PROC = None               # the child guard, when WE started it
+
+
+def _startup_argv():
+    """Argv that relaunches this client - shared by the Run entry, the
+    watchdog task, the guard's respawns and the guard process itself."""
+    if getattr(sys, "frozen", False):        # PyInstaller client.exe
+        return [sys.executable]
+    return [sys.executable, os.path.abspath(__file__)]
+
+
+def _respawn_kiosk():
+    """Start the kiosk again as a quiet auto-start: `--respawn` never
+    shows the "already running" dialog when it races a scheduled tick.
+    Never raises."""
+    try:
+        subprocess.Popen(_startup_argv() + ["--respawn"], close_fds=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        print(f"[CLIENT] Guard could not relaunch the kiosk: {e}")
+
+
+def _guard_tick(state):
+    """One guard cycle; returns False when the guard must stop.
+
+    `state` (mutable dict) carries the cycle: "task" - whether the
+    watchdog task has ever been seen (None = not probed yet, False =
+    probed and absent, e.g. registration still in flight), "n" - cycle
+    counter, "respawn_at" - no second respawn before that timestamp
+    (a kiosk that is still booting holds the mutex anyway, so stacking
+    would only burn onefile extractions on quiet-exiting children).
+    """
+    state["n"] = n = state["n"] + 1
+    if not auto_start_enabled():
+        return False                     # an uninstall switched it off
+    if n == 1 or n % _GUARD_TASK_EVERY == 0:
+        exists = _task_exists(WATCHDOG_TASK_REPEAT)
+        if not exists and state["task"]:
+            return False                 # removed after we saw it
+        if exists:
+            state["task"] = True         # arm the check on first sighting
     if acquire_single_instance():
-        return "start"
-    return "quiet" if any(str(a).lower() == "--watchdog" for a in argv) \
-        else "conflict"
+        release_single_instance()
+        if time.time() >= state["respawn_at"]:
+            state["respawn_at"] = time.time() + _GUARD_BOOT_SECONDS
+            _respawn_kiosk()
+    return True
+
+
+def run_guard():
+    """`client.exe --guard`: watch over the kiosk and relaunch it within
+    seconds after a kill (Bug 4).  One guard per PC - a second one exits
+    at once.  Ticks first, then sleeps; daemon-like, never raises and
+    never touches Tk."""
+    if not acquire_guard_instance():
+        return
+    state = {"task": None, "n": 0, "respawn_at": 0.0}
+    try:
+        while _guard_tick(state):
+            time.sleep(GUARD_POLL_SECONDS)
+    finally:
+        release_guard_instance()
+
+
+def _spawn_guard():
+    """Start the guard next to this kiosk (one at a time).  Never raises."""
+    global _GUARD_PROC
+    if _GUARD_PROC is not None and _GUARD_PROC.poll() is None:
+        return
+    try:
+        _GUARD_PROC = subprocess.Popen(
+            _startup_argv() + ["--guard"], close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        _GUARD_PROC = None
+        print(f"[CLIENT] Guard not started: {e}")
+
+
+def _stop_guard():
+    """Stop the guard THIS process started - before the kiosk frees its
+    mutex (a live guard would relaunch us mid-exit).  Idempotent,
+    never raises."""
+    global _GUARD_PROC
+    proc, _GUARD_PROC = _GUARD_PROC, None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+    except Exception:
+        pass
 
 
 # P1-6: the only account types allowed to uninstall the Client from the
@@ -4077,12 +4340,16 @@ def _uninstall_client_work(dest=None):
     told exactly what did and did not happen.
     """
     out = []
+    set_auto_start(False)             # FIRST: the 15-min self-heal stands down
+    _stop_guard()                     # the seconds-level respawner stops too
     ok1 = remove_startup_registration()
     out.append("Windows Startup entry removed" if ok1
                else "Windows Startup entry could not be removed")
     ok2 = remove_watchdog()
     out.append("Watchdog tasks removed" if ok2
                else "No watchdog tasks to remove")
+    cad_policy_clear()
+    out.append("Ctrl+Alt+Del restrictions cleared")
     local_store.log_event(
         "WARN", "maintenance", "Client uninstalled",
         "Auto-start removed from this PC (Startup entry + watchdog "
@@ -4114,16 +4381,39 @@ def _notify_already_running():
         pass
 
 
+def uninstall_startup_work():
+    """`--uninstall-startup` core, shared by client.py AND main.py: drop
+    the Run entry and both watchdog tasks, switch auto-start off (so a
+    kiosk that is still running cannot heal them back) and clear the CAD
+    policies.  Returns (run_entry_ok, tasks_ok); never raises, no UI."""
+    set_auto_start(False)
+    ok = remove_startup_registration()
+    wok = remove_watchdog()
+    cad_policy_clear()
+    print("[CLIENT] Windows startup entry removed" if ok
+          else "[CLIENT] Windows startup entry could not be removed")
+    print("[CLIENT] Watchdog tasks removed" if wok
+          else "[CLIENT] No watchdog tasks to remove")
+    return ok, wok
+
+
 def run_client():
     # P2/P1-4: `--uninstall-startup` removes the Windows startup entry
     # and both watchdog tasks, then exits without ever opening the kiosk.
     if "--uninstall-startup" in sys.argv:
-        ok = remove_startup_registration()
-        wok = remove_watchdog()
-        print("[CLIENT] Windows startup entry removed" if ok
-              else "[CLIENT] Windows startup entry could not be removed")
-        print("[CLIENT] Watchdog tasks removed" if wok
-              else "[CLIENT] No watchdog tasks to remove")
+        uninstall_startup_work()
+        return
+    # Bug 4: the guard is its own process with its own work loop - it
+    # must never run the kiosk gate below.
+    if "--guard" in sys.argv:
+        run_guard()
+        return
+    # Auto-started starts never switch auto-start back on - only a human
+    # launching the kiosk does - and while an uninstall has switched it
+    # off, a stale tick or guard child must not resurrect the kiosk.
+    hand_start = not any(str(a).lower() in ("--watchdog", "--respawn")
+                         for a in sys.argv[1:])
+    if not hand_start and not auto_start_enabled():
         return
     # P0-1/P1-4: exactly one Client per PC.  A scheduled `--watchdog`
     # tick that finds the kiosk already up just leaves (it is a routine
@@ -4136,8 +4426,14 @@ def run_client():
         _notify_already_running()
         return
     try:
+        if hand_start:
+            set_auto_start(True)    # a hand start re-enables auto-start
         register_startup()      # idempotent - runs on every client start
         app = ClientApp()
+        # Bug 4: seconds-level relaunch watcher (the minute task stays as
+        # the backstop).  Started only now: the kiosk exists and already
+        # holds its mutex, so the guard can never see a down PC at first.
+        _spawn_guard()
         # P1-4: schedule the watchdog only now that the kiosk exists, and
         # off the UI thread - schtasks takes a few hundred ms and must
         # never delay the lock screen.  Best effort by design.
@@ -4157,6 +4453,11 @@ def run_client():
             app.stop_observation()   # P1-7: never leave a stream running
             app.net.stop()
     finally:
+        # Order matters: stop the guard BEFORE freeing the mutex (a live
+        # guard would relaunch us mid-exit), and hand Windows its normal
+        # Ctrl+Alt+Del back - every exit leaves a bare desktop.
+        _stop_guard()
+        cad_policy_clear()
         release_single_instance()
 
 

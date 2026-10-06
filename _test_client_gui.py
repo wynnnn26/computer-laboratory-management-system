@@ -24,6 +24,13 @@ client.HotkeyBlocker.shutdown = lambda self: setattr(self, "active", False)
 # open it deliberately (every other call in this suite stays a no-op).
 _real_ask_server_config = client.ClientApp.__dict__["_ask_server_config"]
 client.ClientApp._ask_server_config = lambda self: None
+# ...and the CAD-policy writes must never touch the real registry here: a
+# crashed run must never leave Task Manager policy-disabled on this PC.
+# _reg_write/_reg_delete are the choke points both suites swap.
+_cad_reg = []
+client._reg_write = lambda path, name, value: _cad_reg.append(
+    ("set", path, name, value))
+client._reg_delete = lambda path, name: _cad_reg.append(("del", path, name))
 
 FAIL = []
 def check(name, cond, extra=""):
@@ -73,6 +80,17 @@ check("[login] PC footer + LAN Connection",
       f"{app.foot_pc_lbl.cget('text')} | {app.foot_conn_lbl.cget('text')}")
 check("[login] button label is LOGIN", str(app.login_btn.cget("text")) == "LOGIN",
       str(app.login_btn.cget("text")))
+
+# --- CAD-policy hardening follows the screen (Bug 2) ------------------------
+from startup_ids import CAD_POLICY_VALUES as _CADV
+_cad_sets = [("set", p, n, 1) for p, n in _CADV]
+_cad_dels = [("del", p, n) for p, n in _CADV]
+check("[cad] the startup login card hardens every CAD option",
+      _cad_reg[-5:] == _cad_sets, str(_cad_reg[-5:]))
+check("[cad] exactly five documented policy values are written",
+      len(_CADV) == 5 and _cad_reg[-5:] == _cad_sets,
+      f"{len(_CADV)} {[n for _, n in _CADV]}")
+
 
 # --- "Verifying..." can never get stuck (Phase A/#5) ----------------------
 app.net.connected = True              # pretend the link is up, no answer
@@ -318,11 +336,14 @@ check("[disconnect] reconnect message shown",
       "Reconnecting" in app.msg_lbl.cget("text"))
 
 # --- Admin Force Login: unlock restores the session without credentials ---
+_cad_reg.clear()
 app.handle_command(Message.create(MessageType.CMD_UNLOCK, {"command_id": "c5b"}))
 app.update()
 check("[unlock] force login restores session",
       app.state == "unlocked" and bool(app.session_id))
 check("[unlock] kiosk hidden again", not app.winfo_viewable())
+check("[cad] unlock to the bare desktop restores Windows (policies gone)",
+      _cad_reg[-5:] == _cad_dels, str(_cad_reg[-5:]))
 
 # --- M1: force login with NO account on the machine - the kiosk lands on ---
 # --- the normal login screen (unlock never needs a user present).          ---
@@ -332,11 +353,35 @@ app.handle_command(Message.create(MessageType.CMD_LOCK,
                                    "command_id": "n1"}))
 app.update()
 check("[m1] locked with no session", app.state == "admin_lock", str(app.state))
+_cad_reg.clear()
 app.handle_command(Message.create(MessageType.CMD_UNLOCK, {"command_id": "n2"}))
 app.update()
 check("[m1] unlock with no session lands on the login screen",
       app.state == "login" and app.winfo_viewable(),
       f"{app.state} viewable={app.winfo_viewable()}")
+
+# --- Bug 3: the login after a no-session unlock must be ACCEPTED.  The card
+# looks unchanged (same widgets, only the green message differs), so prove
+# the credentials path is NOT the admin-lock refusal: it has to send the
+# auth request ("Verifying…"), never bounce with "locked by the administrator".
+_was_conn = app.net.connected
+app._cancel_verify_timeout()    # kill any timer an earlier verify test leaked
+app.net.connected = True             # online path: the request must go out
+app.id_var.set("2023-00001"); app.pw_var.set("student123")
+app.attempt_login()
+app.update()
+check("[m1] login is accepted right after a no-session unlock",
+      str(app.login_btn.cget("text")) == "Verifying…"
+      and "locked by the administrator" not in str(app.msg_lbl.cget("text"))
+      and app.state != "admin_lock",
+      f"btn={app.login_btn.cget('text')} state={app.state} "
+      f"msg={app.msg_lbl.cget('text')}")
+check("[cad] the login card re-applies the CAD policies after unlock",
+      _cad_reg[-5:] == _cad_sets, str(_cad_reg[-5:]))
+app._cancel_verify_timeout()         # drop the pending 15 s timer: it must
+app._verify_timeout()                # not fire into a LATER test's Verifying
+app.update()
+app.net.connected = _was_conn
 
 # --- re-login resumes the same session ------------------------------------
 old = app.session_id
@@ -732,12 +777,15 @@ check("[udp] kiosk fell back to the saved server_ip",
       app.net.server_ip == "127.0.0.1", str(app.net.server_ip))
 
 # --- pause / resume (pause NEVER auto-expires, Phase B/#6) ----------------
+_cad_reg.clear()
 app.handle_command(Message.create(MessageType.CMD_PAUSE,
                                   {"params": {"message": "brb", "seconds": 30},
                                    "command_id": "c2"}))
 app.update()
 check("[config] pause overlay appears",
       app.state == "paused" and app.pause_win is not None)
+check("[cad] the pause overlay hardens the CAD options",
+      _cad_reg[-5:] == _cad_sets, str(_cad_reg[-5:]))
 check("[config] pause hides kiosk/bar",
       not app.winfo_viewable() and not app.bar.winfo_viewable())
 check("[pause] no auto-expiry scheduled", app.pause_until == 0,
@@ -751,6 +799,8 @@ app.handle_command(Message.create(MessageType.CMD_RESUME, {"command_id": "c3"}))
 app.update()
 check("[config] resume restores session",
       app.state == "unlocked" and app.pause_win is None and app.bar.winfo_viewable())
+check("[cad] resume returns Windows to fully normal",
+      _cad_reg[-5:] == _cad_dels, str(_cad_reg[-5:]))
 
 # --- repeated pause must not leak a second overlay ------------------------
 app.handle_command(Message.create(MessageType.CMD_PAUSE,
@@ -1149,7 +1199,12 @@ check("[p1-4] watchdog command relaunches this very app",
       _wcmd.endswith("--watchdog")
       and os.path.basename(sys.executable).lower() in _wcmd.lower(),
       _wcmd)
-# idle PC: the tick may start the kiosk (this is the recovery path)
+# idle PC: the tick may start the kiosk (this is the recovery path).
+# The gate only lets a tick start while its scheduled task still exists
+# (a tick whose task a panic/uninstall already deleted must stay quiet),
+# so the task's presence is stubbed in - real schtasks is exercised below.
+_te_orig = client._task_exists
+client._task_exists = lambda name: True
 check("[p1-4] a tick on an idle PC is allowed to start",
       client._watchdog_conflict(["client.exe", "--watchdog"]) == "start")
 # hold the mutex the way ANOTHER running process would, then re-tick
@@ -1159,6 +1214,7 @@ check("[p1-4] a tick while running exits silently (no second kiosk)",
       client._watchdog_conflict(["client.exe", "--watchdog"]) == "quiet")
 check("[p1-4] a human double-launch is reported, not silent",
       client._watchdog_conflict(["client.exe"]) == "conflict")
+client._task_exists = _te_orig
 client._SINGLE_INSTANCE_HANDLE = _owner
 client.release_single_instance()
 check("[p1-4] nothing left held after the watchdog gate",
@@ -1372,6 +1428,8 @@ check("[panic] audited durably, chord keys never logged",
 check("[panic] both watchdog tasks and the Run entry are dropped",
       _m3["wd"] == 1 and _m3["run"] == 1, str(_m3))
 check("[panic] the exit was requested", _m3["exit"] == 1, str(_m3))
+check("[cad] panic stop hands Windows its normal Ctrl+Alt+Del back",
+      _cad_reg[-5:] == _cad_dels, str(_cad_reg[-5:]))
 # double delivery (Tk binding AND hook, both allowed to fire) must neither
 # double-log nor re-run the removals - the first delivery wins.
 app2._panic_stop()
@@ -1497,7 +1555,7 @@ if os.path.exists(_p16_dest):
     os.remove(_p16_dest)
 _lines16 = client._uninstall_client_work(_p16_dest)
 check("[p1-6] real uninstall reports every step",
-      len(_lines16) == 3 and all(isinstance(x, str) and x for x in _lines16),
+      len(_lines16) == 4 and all(isinstance(x, str) and x for x in _lines16),
       str(_lines16))
 check("[p1-6] the local log is exported",
       os.path.exists(_p16_dest) and os.path.getsize(_p16_dest) > 0)
@@ -1690,11 +1748,15 @@ check("[share-hk] opening the overlay arms the blocker",
       and getattr(app2, "_share_hotkeys", False) is True,
       f"active={app2.hotkeys.active} "
       f"flag={getattr(app2, '_share_hotkeys', None)}")
+check("[cad] an open share hardens CAD even on the bare desktop",
+      _cad_reg[-5:] == _cad_sets, str(_cad_reg[-5:]))
 app2._share_close("phase-a test")
 check("[share-hk] closing the overlay (still unlocked) restores it",
       app2.hotkeys.active is False
       and getattr(app2, "_share_hotkeys", False) is False,
       f"active={app2.hotkeys.active}")
+check("[cad] closing the share restores Windows again",
+      _cad_reg[-5:] == _cad_dels, str(_cad_reg[-5:]))
 # a lock screen reached MID-SHARE keeps the blocker the share armed
 app2._share_open("tester")
 app2._show_lock("phase-a lock", error=True)     # lock screen mid-share
@@ -1704,6 +1766,8 @@ check("[share-hk] closing while locked leaves the blocker running",
       app2.state == "login" and app2.hotkeys.active is True
       and getattr(app2, "_share_hotkeys", False) is False,
       f"{app2.state} active={app2.hotkeys.active}")
+check("[cad] closing the share while a kiosk screen is up keeps the policies",
+      _cad_reg[-5:] == _cad_sets, str(_cad_reg[-5:]))
 # cleanup: back to the plain login screen the rest of the suite expects
 app2._show_lock("phase-a cleanup", error=False)
 app2.update()
@@ -1885,6 +1949,28 @@ _wd_l = client._task_exists(client.WATCHDOG_TASK_LOGON)
 _wd_r = client._task_exists(client.WATCHDOG_TASK_REPEAT)
 check("[startup] --uninstall-startup clears the watchdog tasks",
       not _wd_l and not _wd_r, f"logon={_wd_l} repeat={_wd_r}")
+# --- Bug 4: the uninstall switches auto-start off; a hand start switches
+# it back on - nothing else may ever re-enable it.
+check("[startup] --uninstall-startup switches auto-start off",
+      client.auto_start_enabled() is False, str(client.load_config()))
+client.set_auto_start(True)          # exactly what a hand start does
+check("[startup] a hand start switches auto-start back on",
+      client.auto_start_enabled() is True, str(client.load_config()))
+check("[startup] with auto-start on the Run entry registers again",
+      client.register_startup() is True and _read_run_value() is not None,
+      str(_read_run_value()))
+client.set_auto_start(False)
+check("[startup] auto-start off refuses Run-entry registration",
+      client.register_startup() is False, str(_read_run_value()))
+client.remove_startup_registration()
+check("[startup] the Run entry is still removable while auto-start is off",
+      _read_run_value() is None, str(_read_run_value()))
+# leave the machine as the suite found it: original config, no Run entry
+if had_config and backup is not None:
+    with open(cfg_file, "w", encoding="utf-8") as f:
+        f.write(backup)
+elif os.path.exists(cfg_file):
+    os.remove(cfg_file)
 
 print(flush=True)
 if FAIL:

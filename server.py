@@ -1433,8 +1433,11 @@ class LabServer:
                 except Exception as e:
                     resp = {"success": False, "error": str(e)}
                 if resp.get("success"):
+                    # the client's own ack (e.g. unlock's "force_login"
+                    # vs "login_allowed") rides along for the result line
                     results[pc] = {"success": True, "result": "SUCCESS",
-                                   "command_id": resp.get("command_id", "")}
+                                   "command_id": resp.get("command_id", ""),
+                                   "detail": str(resp.get("result") or "")}
                 else:
                     err = str(resp.get("error") or "")
                     low = err.lower()

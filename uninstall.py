@@ -6,10 +6,11 @@ Removes, in this order:
 
   1. both watchdog tasks        - nothing can restart the client
   2. the HKCU Run entry         - it cannot start at sign-in
-  3. every running client.exe   - the kiosk really stops
-  4. the local audit log        - exported to CSV first; kept, not
+  3. the HKCU CAD policies       - Ctrl+Alt+Del is fully normal again
+  4. every running client.exe   - the kiosk really stops
+  5. the local audit log        - exported to CSV first; kept, not
                                   deleted, when that export fails
-  5. the client files           - client.exe, lab_client.db*, lab_config.json
+  6. the client files           - client.exe, lab_client.db*, lab_config.json
 
 Every step reports its own outcome (failures start with "FAILED:", never
 a polite lie), the result is shown in a message box, and the app then
@@ -28,7 +29,8 @@ import subprocess
 import sys
 
 from startup_ids import (WATCHDOG_TASK_LOGON, WATCHDOG_TASK_REPEAT,
-                         STARTUP_KEY_PATH, STARTUP_VALUE_NAME)
+                         STARTUP_KEY_PATH, STARTUP_VALUE_NAME,
+                         CAD_POLICY_VALUES)
 
 CLIENT_IMAGE = "client.exe"
 # the files a Client install owns in THIS folder
@@ -76,6 +78,31 @@ def remove_run_entry():
             return f"Startup entry already gone: {STARTUP_VALUE_NAME}"
     except Exception as e:
         return f"FAILED: startup entry not removed: {e}"
+
+
+def remove_cad_policy():
+    """Clear the Ctrl+Alt+Del restrictions the Client applies while a
+    kiosk screen is up (Bug 2).  The registry survives file deletion, so
+    the uninstaller must free it explicitly; missing values count as
+    done.  Names come from startup_ids - the same source the Client
+    writes them from, so this can never drift."""
+    try:
+        import winreg
+    except Exception as e:
+        return [f"FAILED: Ctrl+Alt+Del restrictions not cleared: {e}"]
+    out = []
+    for path, name in CAD_POLICY_VALUES:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                                winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, name)
+            out.append(f"Ctrl+Alt+Del restriction cleared: {name}")
+        except FileNotFoundError:
+            out.append(f"Ctrl+Alt+Del restriction already clear: {name}")
+        except Exception as e:
+            out.append(f"FAILED: Ctrl+Alt+Del restriction not cleared: "
+                       f"{name} ({e})")
+    return out
 
 
 def stop_client():
@@ -174,6 +201,7 @@ def main(argv=None):
     lines = []
     lines += remove_tasks()
     lines.append(remove_run_entry())
+    lines += remove_cad_policy()
     lines.append(stop_client())
     lines += export_and_remove_files()
     ok = not any(l.startswith("FAILED") for l in lines)

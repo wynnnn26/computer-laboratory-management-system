@@ -1550,8 +1550,13 @@ def client_loop():
             out.msg_id = msg.msg_id
             w.send_message(out)
         elif msg.payload.get("command_id"):
-            # ACK every command (never executes anything for real)
-            w.send_message(build_command_response(msg.payload.get("command_id"), True))
+            # ACK every command (never executes anything for real); the
+            # unlock ack carries the client's own result like the real one
+            # ("login_allowed" when no session was open - Bug 3).
+            _res = ("login_allowed"
+                    if msg.type == MessageType.CMD_UNLOCK.value else None)
+            w.send_message(build_command_response(
+                msg.payload.get("command_id"), True, result=_res))
 threading.Thread(target=client_loop, daemon=True).start()
 time.sleep(0.2)
 
@@ -1585,6 +1590,14 @@ check("M1: offline PC's persisted lock is cleared by unlock-all",
       row is not None and not row["admin_state"],
       str(row and row["admin_state"]))
 srv.clients["TEST-PC"].is_online = True
+# Bug 3: the per-PC result carries the client's own ack, so an operator
+# can tell "session restored" (force_login) from "just the login card is
+# open" (login_allowed) right in the result line.
+res = srv.bulk_command("unlock", ["TEST-PC"], admin_user="tester")
+check("online PC unlock reports SUCCESS with the client's ack",
+      res.get("TEST-PC", {}).get("result") == "SUCCESS"
+      and res.get("TEST-PC", {}).get("detail") == "login_allowed",
+      str(res.get("TEST-PC")))
 
 # --- M2: a password change reaches every ONLINE Client PC at once ----------
 class _AuthEntry:
@@ -2474,6 +2487,34 @@ check("[remote] a point at 75 % / 60 % maps exactly",
 check("[remote] a pointer left of the picture is never forwarded",
       dash._remote_norm(_rw, _types.SimpleNamespace(
           x_root=_ox - 10, y_root=_oy + 5)) is None)
+# Production hands _remote_norm a ctk.CTkImage (_viewer_show), which exposes
+# NO width()/height() - the PhotoImage above has them, which is exactly how
+# the dead-mouse bug slipped past this block: every mouse event hit the
+# except and was dropped.  Re-run the same mapping with the real type.
+_cki = _ctk.CTkImage(
+    light_image=_PILImage.new("RGB", (320, 180), (30, 60, 120)),
+    size=(320, 180))
+check("[remote] ctk.CTkImage has no width() - the regression trigger",
+      not hasattr(_cki, "width"), str(type(_cki).__name__))
+_rl.configure(image=_cki, text="")
+_rl.image = _cki
+root.update_idletasks()
+_iw2, _ih2 = _cki._size
+_ox2 = _rl.winfo_rootx() + (_lw - _iw2) // 2
+_oy2 = _rl.winfo_rooty() + (_lh - _ih2) // 2
+_mid2 = dash._remote_norm(_rw, _types.SimpleNamespace(
+    x_root=_ox2 + _iw2 // 2, y_root=_oy2 + _ih2 // 2))
+check("[remote] CTkImage centre maps to (0.5, 0.5)",
+      _mid2 is not None and abs(_mid2[0] - 0.5) < 0.01
+      and abs(_mid2[1] - 0.5) < 0.01, str(_mid2))
+_pt752 = dash._remote_norm(_rw, _types.SimpleNamespace(
+    x_root=_ox2 + int(_iw2 * 0.75), y_root=_oy2 + int(_ih2 * 0.6)))
+check("[remote] CTkImage point at 75 % / 60 % maps exactly",
+      _pt752 is not None and abs(_pt752[0] - 0.75) < 0.01
+      and abs(_pt752[1] - 0.6) < 0.01, str(_pt752))
+check("[remote] CTkImage pointer left of the picture is never forwarded",
+      dash._remote_norm(_rw, _types.SimpleNamespace(
+          x_root=_ox2 - 10, y_root=_oy2 + 5)) is None)
 _rw.destroy()
 # --- spec 1: header keeps Logout, Minimize button removed -------------------
 def _is_button(w):
@@ -4253,14 +4294,21 @@ check("guardrail G3: adapter DNS is written only by restore and repair",
       and _gdn.count("drop_local_dns(") >= 3
       and "probe_local_resolver(" in _gdn, str(_gown))
 
-# G4 - a process is terminated in EXACTLY one place, by PID only: never an
-#      image name, never a process tree
+# G4 - a process is terminated in EXACTLY one place per file, by PID
+#      handle only: never an image name, never a process tree.  The one
+#      in client.py is _stop_guard, which stops ONLY the guard child this
+#      kiosk spawned itself - a child reached through its own handle.
 _gterm = [f for f in _GFILES
           if _gsrc[f].count(".terminate()") or _gsrc[f].count(".kill()")]
 _gtn = sum(_gsrc[f].count(".terminate()") + _gsrc[f].count(".kill()")
            for f in _GFILES)
+_gsi = _gc.find("def _stop_guard")
+_gsb = _gc[_gsi:_gc.find("\ndef ", _gsi + 5)] if _gsi != -1 else ""
 check("guardrail G4: only web_access.close_browser ever kills a process",
-      _gterm == ["web_access.py"] and _gtn == 2, f"{_gterm},{_gtn}")
+      _gterm == ["client.py", "web_access.py"] and _gtn == 3
+      and _gsb.count(".terminate()") == 1
+      and ".kill()" not in _gc and "taskkill" not in _gc,
+      f"{_gterm},{_gtn}")
 
 # G5 - no auto power action: _os_power is the only place that reaches the
 #      OS, and only a one-shot token armed by an admin command opens it
@@ -4307,15 +4355,22 @@ check("guardrail G6: 'enforced' is only claimed after a successful probe",
       and "if not det_ok:" in _gseg,
       str(_gc.count('return _done((True, "detect", None))')))
 
-# G7 - no persistence beyond the existing watchdog / startup entry
+# G7 - no persistence beyond the existing watchdog / startup entry: the
+#      only registry writers are the Run entry (SZ) and the CAD-policy
+#      primitive (Policies\... DWORD hardening - not persistence), and
+#      the only scheduled-task creators are the watchdog registrations.
 _gcreate = [l for l in _gc.splitlines() if '["/Create"' in l]
+_gset = [l for l in _gc.splitlines() if "winreg.SetValueEx" in l]
+_gdel = [l for l in _gc.splitlines() if "winreg.DeleteValue" in l]
 check("guardrail G7: persistence is limited to the existing watchdog",
-      _gc.count("winreg.SetValueEx") == 1
-      and _gc.count("winreg.DeleteValue") == 1
+      len(_gset) == 2
+      and sum("STARTUP_VALUE_NAME" in l for l in _gset) == 1
+      and sum("REG_DWORD" in l for l in _gset) == 1
+      and len(_gdel) == 2
       and _gc.count('["schtasks"]') == 1
       and len(_gcreate) == 2
       and all("WATCHDOG_TASK" in l for l in _gcreate),
-      str([_gc.count("winreg.SetValueEx"), len(_gcreate)]))
+      str([len(_gset), len(_gcreate)]))
 
 # G8 - the sign-off itself: every guardrail above held in THIS run
 check("guardrail G8: every safety guardrail holds",
@@ -4344,6 +4399,42 @@ check("[uninstall] covers every artifact a Client install owns",
 check("[uninstall] imports without side effects (all work lives in main)",
       callable(_un.main) and callable(_un.stop_client)
       and callable(_un.export_and_remove_files), "import-only")
+
+# ---- CAD policy hardening (Bug 2): registry writes are RECORDED, never ---
+# real: _reg_write/_reg_delete are the choke points both suites swap, so a
+# crashed run can never leave Task Manager policy-disabled on this PC.
+_cad_orig = (client_mod._reg_write, client_mod._reg_delete)
+_cad_log = []
+client_mod._reg_write = lambda p, n, v: _cad_log.append(("set", p, n, v))
+client_mod._reg_delete = lambda p, n: _cad_log.append(("del", p, n))
+try:
+    client_mod.cad_policy_apply()
+    check("[cad] apply writes exactly the five policy values",
+          _cad_log == [("set", p, n, 1) for p, n in _sids.CAD_POLICY_VALUES],
+          str(_cad_log))
+    _cad_log.clear()
+    client_mod.cad_policy_clear()
+    check("[cad] clear removes exactly the five policy values",
+          _cad_log == [("del", p, n) for p, n in _sids.CAD_POLICY_VALUES],
+          str(_cad_log))
+    client_mod.cad_policy_clear()        # a clean machine must be a no-op
+    check("[cad] clear is idempotent (still succeeds when already clear)",
+          len(_cad_log) == 10, str(len(_cad_log)))
+    _cad_log.clear()
+    client_mod._cad_policy_sync(True)
+    client_mod._cad_policy_sync(False)
+    check("[cad] sync routes locked screens to apply, the desktop to clear",
+          _cad_log == ([("set", p, n, 1) for p, n in _sids.CAD_POLICY_VALUES]
+                       + [("del", p, n) for p, n in _sids.CAD_POLICY_VALUES]),
+          str(_cad_log))
+finally:
+    client_mod._reg_write, client_mod._reg_delete = _cad_orig
+# the uninstaller's own cleanup uses the REAL registry, but only ever
+# DELETES these five values - on a clean machine they are already absent
+_cadu = _un.remove_cad_policy()
+check("[uninstall] CAD cleanup reports success without any FAILED line",
+      len(_cadu) == len(_sids.CAD_POLICY_VALUES)
+      and not any(l.startswith("FAILED") for l in _cadu), str(_cadu))
 
 # ---- watchdog: registration repairs stale / missing tasks (P1-4)-----------
 # _schtasks is swapped for a stateful fake, so NO real task is ever
@@ -4451,6 +4542,132 @@ try:
           and any(s == "WARN" and "failed" in m.lower() for s, m in _wd_ev),
           f"ok={_ok} ev={_wd_ev}")
     _wd_fail_create[0] = False
+    # --- Bug 4: an uninstall switched auto-start off -----------------------
+    _wd_lo = client_mod.load_config
+    try:
+        client_mod.load_config = lambda: {"auto_start": False}
+        _wd_calls.clear()
+        _ok = client_mod.register_watchdog()
+        check("[watchdog] auto-start off: nothing is registered or healed",
+              _ok is False
+              and not [c for c in _wd_calls if c[0] == "/Create"],
+              f"ok={_ok} calls={_wd_calls}")
+        _g = {"task": None, "n": 0, "respawn_at": 0.0}
+        check("[guard] auto-start off stops the guard at its next cycle",
+              client_mod._guard_tick(_g) is False, str(_g))
+    finally:
+        client_mod.load_config = _wd_lo
+    # --- Bug 4: the gate for every kind of starter -------------------------
+    # (a running kiosk = the mutex is held; same-process holders are
+    # ambiguous, so the acquisition itself is patched for the busy cases)
+    _asi2_orig = client_mod.acquire_single_instance
+    client_mod.acquire_single_instance = lambda: False
+    try:
+        check("[watchdog] a busy kiosk makes a --watchdog tick exit quietly",
+              client_mod._watchdog_conflict(
+                  ["client.py", "--watchdog"]) == "quiet")
+        check("[watchdog] a busy kiosk makes a guard --respawn exit quietly",
+              client_mod._watchdog_conflict(
+                  ["client.py", "--respawn"]) == "quiet")
+        check("[watchdog] a human second copy is told, never quiet",
+              client_mod._watchdog_conflict(["client.py"]) == "conflict")
+    finally:
+        client_mod.acquire_single_instance = _asi2_orig
+    _wd_state[client_mod.WATCHDOG_TASK_REPEAT] = client_mod._watchdog_command()
+    check("[watchdog] a tick WITH its task may start the kiosk",
+          client_mod._watchdog_conflict(["client.py", "--watchdog"]) == "start")
+    client_mod.release_single_instance()
+    # the in-flight-race closure: panic/uninstall/Server mode deleted the
+    # task while this tick was already on its way
+    del _wd_state[client_mod.WATCHDOG_TASK_REPEAT]
+    check("[watchdog] an in-flight tick whose task is gone stays quiet",
+          client_mod._watchdog_conflict(["client.py", "--watchdog"]) == "quiet")
+    check("[watchdog] the refused tick releases the mutex again",
+          client_mod.acquire_single_instance() is True)
+    client_mod.release_single_instance()
+    # --- Bug 4: the guard's one cycle --------------------------------------
+    _sp_orig = client_mod._respawn_kiosk
+    _spawns = []
+    client_mod._respawn_kiosk = lambda: _spawns.append("spawn")
+    try:
+        _wd_state[client_mod.WATCHDOG_TASK_REPEAT] = client_mod._watchdog_command()
+        _g = {"task": None, "n": 0, "respawn_at": 0.0}
+        check("[guard] a down kiosk is relaunched within one cycle",
+              client_mod._guard_tick(_g) is True and _spawns == ["spawn"],
+              str(_spawns))
+        check("[guard] the next cycle must not stack a second respawn",
+              client_mod._guard_tick(_g) is True and _spawns == ["spawn"],
+              str(_spawns))
+        # kiosk up (the mutex is held elsewhere): the guard watches, it
+        # does not spawn - the same-process short-circuit makes a real
+        # holder ambiguous, so the holder itself is patched in
+        _asi_orig = client_mod.acquire_single_instance
+        client_mod.acquire_single_instance = lambda: False
+        try:
+            _g2 = {"task": None, "n": 0, "respawn_at": 0.0}
+            check("[guard] a running kiosk is left alone (no respawn)",
+                  client_mod._guard_tick(_g2) is True and _spawns == ["spawn"],
+                  str(_spawns))
+        finally:
+            client_mod.acquire_single_instance = _asi_orig
+        # the task it mirrors was removed after being seen (panic stop,
+        # uninstall, Server mode) - the guard re-probes every
+        # _GUARD_TASK_EVERY-th cycle, so land on the next probe tick
+        del _wd_state[client_mod.WATCHDOG_TASK_REPEAT]
+        _g["n"] = client_mod._GUARD_TASK_EVERY - 1
+        check("[guard] removal of the watchdog task stops the guard",
+              client_mod._guard_tick(_g) is False, str(_g))
+    finally:
+        client_mod._respawn_kiosk = _sp_orig
+    # the respawn starts THIS app again, as a quiet auto-start
+    _popen_rec = []
+
+    class _FakeProc:
+        def poll(self):
+            return None
+
+    class _FakeSub:
+        CREATE_NO_WINDOW = 0
+
+        @staticmethod
+        def Popen(argv, **kw):
+            _popen_rec.append(list(argv))
+            return _FakeProc()
+
+    _sub_orig = client_mod.subprocess
+    client_mod.subprocess = _FakeSub
+    try:
+        client_mod._respawn_kiosk()
+        check("[guard] the respawn starts a quiet --respawn copy of this app",
+              bool(_popen_rec)
+              and _popen_rec[0][:-1] == client_mod._startup_argv()
+              and _popen_rec[0][-1] == "--respawn", str(_popen_rec))
+    finally:
+        client_mod.subprocess = _sub_orig
+    # run_guard itself: its own mutex keeps it single (a second guard
+    # never even ticks), one tick decides whether it keeps watching, and
+    # the mutex is released again on the way out
+    _gt_orig = client_mod._guard_tick
+    _agi_orig = client_mod.acquire_guard_instance
+    _ticks = []
+    try:
+        client_mod.acquire_guard_instance = lambda: False   # "busy elsewhere"
+        client_mod._guard_tick = lambda st: (_ticks.append(dict(st)), False)[1]
+        client_mod.run_guard()
+        check("[guard] a second guard exits without ever ticking",
+              _ticks == [], str(_ticks))
+        client_mod.acquire_guard_instance = _agi_orig
+        client_mod.run_guard()          # first tick says stop -> returns now
+        check("[guard] run_guard ticks once and honours a stop",
+              len(_ticks) == 1, str(_ticks))
+        _h, _ex = client_mod._mutex_create(
+            client_mod.SINGLE_INSTANCE_MUTEX_GUARD)
+        client_mod._mutex_close(_h)
+        check("[guard] run_guard releases its mutex on exit",
+              _ex is False, f"exists={_ex}")
+    finally:
+        client_mod._guard_tick = _gt_orig
+        client_mod.acquire_guard_instance = _agi_orig
 finally:
     client_mod._schtasks = _wd_sch_orig
     client_mod._watchdog_evidence = _wd_ev_orig

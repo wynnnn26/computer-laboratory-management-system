@@ -102,6 +102,12 @@ managing a school computer laboratory / internet café over a **LAN only**
   explicit Admin Unlock (force login) releases the PC. Force Unlock
   always targets **every** PC regardless of the current selection, and
   an offline PC's unlock is remembered and applied when it reconnects.
+  Each result line carries the client's own ack —
+  `PC1: SUCCESS  (force_login)` (a session was restored) vs
+  `(login_allowed)` (the PC landed on its login card) — so both
+  outcomes are visible per PC, and a PC with **no session accepts a
+  normal login immediately** after such an unlock (never the
+  "locked by the administrator" refusal).
 - **Emergency hotkey Ctrl+Shift+Alt+M**: a locked Client kiosk whose
   Server is unreachable can be force-unlocked locally - it reuses the
   normal force-unlock UI path (a still-open session is restored),
@@ -390,28 +396,43 @@ with.
   Shutdown are the two controls that always ask first, listing the
   affected PCs, and issue nothing if the operator declines. Every
   shutdown/restart is audited with admin, PC, timestamp and result.
-- **Client lifecycle (background, watchdog, uninstall):** the kiosk is a
+- **Client lifecycle (background, watchdog, guard, uninstall):** the kiosk is a
   single instance per user (named mutex `Local\ComputerLaboratoryClient`)
   and can be parked in the notification area with an *Open Dashboard*
   action. Two scheduled tasks created at first run — **Computer
   Laboratory Client Logon** (`/SC ONLOGON`) and **Computer Laboratory
   Client Watchdog** (`/SC MINUTE /MO 1`), both unelevated — relaunch it
   with `--watchdog` if it ever stops, so a lab PC returns to the kiosk
-  after a crash, a sign-out, a reboot or a Task Manager kill. Every
-  registration — at start-up, then every 15 minutes while the kiosk
-  runs — compares each task's stored command with this app and repairs
-  a stale or deleted task (a refused registration lands in the local
-  log as a throttled WARN); starting the Server on that
-  same machine removes both tasks so a kiosk can never open on top of
-  the Admin console. `python main.py --uninstall-startup` removes the
-  Windows Startup entry and both tasks and exits without opening the
-  kiosk; the same cleanup is available from inside the app under
+  after a crash, a sign-out, a reboot or a Task Manager kill (worst case
+  a minute later). On top of that, every kiosk start launches a tiny
+  **guard process** (`client.exe --guard`, one per PC behind its own
+  named mutex) that notices a kill within **2 seconds** and relaunches
+  the kiosk as the quiet `--respawn` — Task Scheduler refuses any
+  repetition below one minute (a `PT10S` interval is rejected outright
+  by the service), so without the guard a kill would expose the desktop
+  for up to 60 s. The guard never stacks respawns while one is still
+  booting, and stands down by itself when the watchdog task it mirrors
+  is removed (panic stop, uninstall, Server mode) or when auto-start is
+  switched off — it can never undo any of them. Every registration — at
+  start-up, then every 15 minutes while the kiosk runs — compares each
+  task's stored command with this app and repairs a stale or deleted
+  task (a refused registration lands in the local log as a throttled
+  WARN); starting the Server on that same machine removes both tasks so
+  a kiosk can never open on top of the Admin console. An uninstall also
+  writes `auto_start: false` into `lab_config.json`, which both
+  registration choke points honour, so the 15-minute self-heal can never
+  resurrect an uninstall — only a hand start flips the flag back on.
+  `python main.py --uninstall-startup` removes the Windows Startup
+  entry, both tasks, the auto-start flag and the Ctrl+Alt+Del
+  restrictions, and exits without opening the kiosk; the same cleanup is
+  available from inside the app under
   *Server Settings → Maintenance → [Uninstall Client]* (admin and
   maintenance roles only, behind a confirmation), which exports the
   local log to a CSV first. Neither path ever deletes application files
   or the database. The standalone **`dist\uninstall.exe`** (built by
   `build_exe.bat`, requests admin) is the path that does: it removes
-  both watchdog tasks and the Startup entry, **stops every running
+  both watchdog tasks, the Startup entry, the Ctrl+Alt+Del restrictions
+  (the registry survives file deletion), **stops every running
   `client.exe`**, exports the local log to a CSV, deletes the client
   files (`client.exe`, `lab_client.db*`, `lab_config.json`) and finally
   deletes itself — each step reported honestly in a result dialog.
@@ -587,7 +608,7 @@ and the eight `pc_icons/*.png` status icons.
 ## Tests
 
 ```
-python _test_integration.py   # 558 checks: TLS framing, auth & role claim,
+python _test_integration.py   # 584 checks: TLS framing, auth & role claim,
                               # first-login password change (flagged
                               # accounts, sessions blocked until changed,
                               # hashed storage, audit rows),
@@ -708,7 +729,7 @@ python _test_integration.py   # 558 checks: TLS framing, auth & role claim,
                                 # (server pushes fire-and-forget, the
                                 # client syncs in the background, a
                                 # 6-hour periodic push as backstop)
-python _test_client_gui.py    # 274 checks: kiosk state machine, admin lock,
+python _test_client_gui.py    # 290 checks: kiosk state machine, admin lock,
                               # force login, pause, logout, command
                               # de-duplication, login card (password
                               # toggle, server line, PC footer),
@@ -884,9 +905,9 @@ lab_system/
 │                         pc_icons/ status icons, --collect-all
 │                         customtkinter for the dark UI; client.exe also
 │                         pulls in the pystray Windows backend)
-├── _test_integration.py  558-check end-to-end suite (server + protocol +
+├── _test_integration.py  584-check end-to-end suite (server + protocol +
 │                         admin dashboard)
-├── _test_client_gui.py   274-check kiosk state-machine suite
+├── _test_client_gui.py   290-check kiosk state-machine suite
 ├── _probe_layout.py      Responsive layout probe (no clipped rows or
 │                         panel overruns at min/default/large sizes)
 ├── gate.bat              Regression gate: both suites (fresh DBs) +
@@ -964,8 +985,18 @@ lab_system/
   and result - it shows both client events and server commands (with
   results). Every shutdown/restart is explicitly audited.
 - The keyboard hook is best-effort user-mode protection: it blocks common
-  bypass hotkeys while the kiosk is locked. Ctrl+Alt+Del cannot be blocked
-  by any user-mode software (by Windows design).
+  bypass hotkeys while the kiosk is locked. Ctrl+Alt+Del itself cannot be
+  suppressed by any user-mode software (by Windows design) — so while a
+  kiosk screen is up (login card, admin lock, pause overlay, screen
+  share) the client writes the documented HKCU policy values
+  (`DisableTaskMgr`, `DisableLockWorkstation`, `DisableChangePassword`,
+  `HideFastUserSwitching`, `NoLogoff`) and every option that screen
+  offers is policy-disabled. The moment the desktop is bare again —
+  unlock, panic stop, any uninstall path, Server mode — the same five
+  values are deleted and Windows behaves completely normally;
+  `dist\uninstall.exe` clears them through the shared
+  `startup_ids.CAD_POLICY_VALUES` list, because the registry itself
+  survives file deletion.
 
 ## Notes
 

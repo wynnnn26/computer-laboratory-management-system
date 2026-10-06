@@ -29,6 +29,11 @@ print("2) auth      -> state=%r viewable=%s session=%s bar=%s" % (
 
 app.destroy()
 
+# ClientApp.__init__ hardens the CAD policies on its login card; this
+# script never reaches run_client's finally, so hand Windows back what
+# the constructor took (otherwise Task Manager stays policy-blocked).
+client.cad_policy_clear()
+
 # restore original config
 if had_config and backup is not None:
     with open(cfg_path, "w", encoding="utf-8") as f:
