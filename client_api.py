@@ -93,17 +93,11 @@ def _local_send_message(sid, text):
 
 
 def _local_borrow_submit(sid, item, qty):
-    from database import get_connection
-    from utils import now_date
-    conn = get_connection()
-    conn.execute(
-        "INSERT INTO borrow_records (student_id, item_name, quantity, borrow_date, return_date, status) "
-        "VALUES (?,?,?,?,?, 'Pending Approval')",
-        (sid, item, qty, now_date(), ""),
-    )
-    conn.commit()
-    conn.close()
-    return {"ok": True, "data": []}
+    # OFFLINE: borrow needs admin approval, which lives on the server - a
+    # row written here would never sync, so refuse honestly instead of
+    # pretending the request was submitted.
+    return {"ok": False,
+            "error": "Borrow requests require a connection to the server."}
 
 
 # --------------------------------------------------------------- public API

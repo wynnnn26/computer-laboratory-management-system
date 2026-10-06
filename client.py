@@ -2386,6 +2386,11 @@ class ClientApp(ctk.CTk):
             target=self.net.pc_name,
             details=f"{user_data.get('full_name', '')} logged in ({user_data.get('role', '')})",
         ))
+        # The auth roster is served only to authenticated entries now, so
+        # refresh the offline-login cache right after every successful
+        # sign-in (reconnect/schedule/M2 nudges cover the rest).
+        threading.Thread(target=self._sync_auth_roster, daemon=True,
+                         name="roster-post-login").start()
         self._unlock_ui()
 
     def _sync_cad(self):

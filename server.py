@@ -150,6 +150,9 @@ class ClientEntry:
         self.session_id = None
         self.is_online = True
         self.last_heartbeat = time.time()
+        # True once CLIENT_REGISTER completed - the minimum trust level for
+        # the pre-login flows (web policy + log flush); AUTH goes further.
+        self.registered = False
         self.authenticated = False
         self.auth_role = None
         # Server-validated identity of the last successful AUTH (never
@@ -216,6 +219,8 @@ class LabServer:
         self.on_event = on_event or (lambda kind, data: None)
         self.clients = {}                 # pc_name -> ClientEntry
         self.clients_lock = threading.Lock()
+        # username -> [fail_count, locked_until_ts]: account lockout state
+        self._login_fail = {}
         self.running = False
         self.listener = None
         self.server_ssl = None
@@ -560,6 +565,7 @@ class LabServer:
     # ---------------------------------------------------- register/heartbeat
     def _on_register(self, entry, p):
         entry.pc_name = p.get("pc_name", entry.ip)
+        entry.registered = True
         entry.ip = p.get("ip", entry.ip)
         entry.hostname = p.get("hostname", "") or socket.gethostname()
         entry.is_online = True
@@ -843,6 +849,23 @@ class LabServer:
         password = p.get("password") or ""
         client_info = p.get("client_info") or {}
 
+        # Account lockout (security): max_failed_logins wrong attempts
+        # lock the account for lockout_duration seconds (live settings).
+        # ponytail: per-account in-memory counters - a server restart
+        # clears them; DB-backed lockout if restarts must not release it.
+        now = time.time()
+        rec = self._login_fail.get(username) if username else None
+        if rec and rec[1] > now:
+            left = int(rec[1] - now) + 1
+            self._log_activity(username, "login_locked",
+                               entry.pc_name or entry.ip,
+                               f"Locked out ({left}s left) from {entry.ip}",
+                               entry.ip)
+            entry.send(build_auth_response(
+                False, error=f"Account locked. Try again in {left} seconds."))
+            self._emit("auth_failed", {"pc": entry.pc_name, "user": username})
+            return
+
         # NOTE: the client can send any role string it likes - it is
         # deliberately ignored here.  The role always comes from the
         # central DB row, so a client can never self-claim admin.
@@ -854,6 +877,24 @@ class LabServer:
             self._log_activity(username or "?", "login_failed",
                                entry.pc_name or entry.ip,
                                f"Failed login from {entry.ip}", entry.ip)
+            if username:
+                try:
+                    max_fail = int(get_setting("max_failed_logins", "5"))
+                except (TypeError, ValueError):
+                    max_fail = 5
+                cnt = self._login_fail.get(username, [0, 0.0])[0] + 1
+                locked_until = 0.0
+                if cnt >= max_fail:
+                    try:
+                        dur = int(get_setting("lockout_duration", "300"))
+                    except (TypeError, ValueError):
+                        dur = 300
+                    locked_until = now + dur
+                    self._log_activity(
+                        username, "login_locked", entry.pc_name or entry.ip,
+                        f"Locked for {dur}s after {cnt} failures "
+                        f"from {entry.ip}", entry.ip)
+                self._login_fail[username] = [cnt, locked_until]
             entry.send(build_auth_response(False, error="Invalid credentials"))
             self._emit("auth_failed", {"pc": entry.pc_name, "user": username})
             return
@@ -879,6 +920,7 @@ class LabServer:
                        if "must_change_password" in row.keys() else False)
             must_change = flagged or password == DEFAULT_CLIENT_PASSWORD
         entry.must_change_password = must_change
+        self._login_fail.pop(username, None)   # success clears the counter
 
         token = uuid.uuid4().hex
         entry.authenticated = True
@@ -1124,6 +1166,31 @@ class LabServer:
         d = p.get("data", {}) or {}
         ok, data, err = True, [], None
 
+        # Auth gate (security): anything touching accounts, messages or
+        # records needs a successful AUTH on this connection.  The kiosk
+        # legitimately runs two kinds BEFORE anyone logs in, so those stay
+        # reachable to a registered-but-unauthenticated entry: the web
+        # policy (website blocking applies to the machine, not the user)
+        # and the log flush.  The auth roster feeds offline passwords, so
+        # it needs a real login (usable right after the first sign-in).
+        if kind == "auth_roster":
+            if not getattr(entry, "authenticated", False):
+                entry.send(build_stu_response(
+                    msg.msg_id, kind, False, [],
+                    "Not authenticated. Please log in again."))
+                return
+        elif kind in ("web_filter", "log_sync"):
+            if not getattr(entry, "registered", False):
+                entry.send(build_stu_response(
+                    msg.msg_id, kind, False, [],
+                    "Not registered with the server."))
+                return
+        elif not getattr(entry, "authenticated", False):
+            entry.send(build_stu_response(
+                msg.msg_id, kind, False, [],
+                "Not authenticated. Please log in again."))
+            return
+
         try:
             conn = get_connection()
             if kind == "announcements":
@@ -1154,13 +1221,24 @@ class LabServer:
                 data = [dict(r) for r in rows]
 
             elif kind == "borrow_submit":
-                if not d.get("item_name"):
+                # Validation (spec: admin approves every request) - garbage
+                # never reaches the table.
+                sid = str(d.get("student_id", "")).strip()
+                item = str(d.get("item_name", "")).strip()
+                if not sid:
+                    raise ValueError("Student ID is required")
+                if not item:
                     raise ValueError("Item name is required")
+                try:
+                    qty = int(str(d.get("quantity", "1")).strip() or "1")
+                except (TypeError, ValueError):
+                    raise ValueError("Quantity must be a whole number")
+                if qty < 1:
+                    raise ValueError("Quantity must be at least 1")
                 conn.execute(
                     "INSERT INTO borrow_records (student_id, item_name, quantity, borrow_date, "
                     "return_date, status) VALUES (?,?,?,?,?, 'Pending Approval')",
-                    (d.get("student_id", ""), d.get("item_name", ""),
-                     d.get("quantity", "1"), now_date(), ""),
+                    (sid, item, str(qty), now_date(), ""),
                 )
                 conn.commit()
 

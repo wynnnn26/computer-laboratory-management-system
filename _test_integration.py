@@ -1449,6 +1449,156 @@ conn.execute("DELETE FROM client_logs WHERE event_id IN "
 conn.commit()
 conn.close()
 
+# ------------------------------------------------- security: auth gate
+# Nothing that touches accounts, messages or records may be served before
+# AUTH; the web policy + log flush stay reachable to a REGISTERED kiosk
+# (they run before anyone logs in), the auth roster needs a real login.
+wg_raw = socket.create_connection(("127.0.0.1", 18443), timeout=5)
+wg_tls = create_ssl_context(is_server=False).wrap_socket(
+    wg_raw, server_hostname="127.0.0.1")
+wg = TLSSocketWrapper(wg_tls)
+wg.send_message(build_client_register("GATE-PC", "127.0.0.1", "gatehost"))
+for _kind in ("messages_get", "messages_send", "borrow_submit",
+              "borrow_list", "announcements", "profile"):
+    wg.send_message(build_stu_request(_kind, {}))
+    _r = wg.recv_message(timeout=4)
+    check(f"auth gate: {_kind} refused before login",
+          _r is not None and _r.payload.get("ok") is False
+          and "auth" in str(_r.payload.get("error", "")).lower(),
+          str(_r.payload if _r else None))
+wg.send_message(build_stu_request("auth_roster"))
+_r = wg.recv_message(timeout=4)
+check("auth gate: auth_roster refused before login",
+      _r is not None and _r.payload.get("ok") is False
+      and "auth" in str(_r.payload.get("error", "")).lower(),
+      str(_r.payload if _r else None))
+wg.send_message(build_stu_request("web_filter"))
+_r = wg.recv_message(timeout=4)
+_d = _r.payload.get("data") if _r and _r.payload.get("ok") else {}
+check("auth gate: web policy still served to a registered kiosk",
+      _r is not None and _r.payload.get("ok") is True
+      and "mode" in _d and "blocked" in _d,
+      str(dict(_d) if _d else None))
+wg.send_message(build_stu_request("log_sync", {"events": [
+    {"event_id": "gate-1", "pc_name": "GATE-PC", "severity": "INFO",
+     "message": "gate probe"}]}))
+_r = wg.recv_message(timeout=4)
+check("auth gate: log flush still accepted from a registered kiosk",
+      _r is not None and _r.payload.get("ok") is True
+      and (_r.payload.get("data") or {}).get("accepted") == ["gate-1"],
+      str(_r.payload if _r else None))
+wg.close()
+conn = database.get_connection()
+conn.execute("DELETE FROM client_logs WHERE event_id='gate-1'")
+conn.commit()
+conn.close()
+
+# ------------------------------------------- security: account lockout
+# max_failed_logins wrong attempts lock the account for lockout_duration
+# seconds; the correct password is refused while locked, the lock expires,
+# and a success resets the counter.
+from database import hash_password, set_setting
+set_setting("lockout_duration", "5")
+conn = database.get_connection()
+conn.execute(
+    "INSERT INTO users (student_id, password, full_name, role, status) "
+    "VALUES ('lock_victim', ?, 'Lock Victim', 'student', 'Active')",
+    (hash_password("lockpass99"),))
+conn.commit()
+conn.close()
+wl_raw = socket.create_connection(("127.0.0.1", 18443), timeout=5)
+wl_tls = create_ssl_context(is_server=False).wrap_socket(
+    wl_raw, server_hostname="127.0.0.1")
+wl = TLSSocketWrapper(wl_tls)
+for _i in range(5):
+    wl.send_message(build_auth_request("lock_victim", f"WRONG{_i}",
+                                        "student", {}))
+    wl.recv_message(timeout=4)
+wl.send_message(build_auth_request("lock_victim", "lockpass99",
+                                    "student", {}))
+_r = wl.recv_message(timeout=8)
+check("lockout: correct password refused after max_failed_logins failures",
+      _r is not None and _r.payload.get("success") is False
+      and "locked" in str(_r.payload.get("error", "")).lower(),
+      str(_r.payload if _r else None))
+time.sleep(5.3)
+wl.send_message(build_auth_request("lock_victim", "lockpass99",
+                                    "student", {}))
+_r = wl.recv_message(timeout=8)
+check("lockout: lock expires after lockout_duration seconds",
+      _r is not None and _r.payload.get("success") is True,
+      str(_r.payload if _r else None))
+wl.send_message(build_auth_request("lock_victim", "WRONG-AGAIN",
+                                    "student", {}))
+wl.recv_message(timeout=4)
+wl.send_message(build_auth_request("lock_victim", "lockpass99",
+                                    "student", {}))
+_r = wl.recv_message(timeout=8)
+check("lockout: a success resets the failure counter",
+      _r is not None and _r.payload.get("success") is True,
+      str(_r.payload if _r else None))
+wl.close()
+set_setting("lockout_duration", "300")
+conn = database.get_connection()
+conn.execute("DELETE FROM users WHERE student_id='lock_victim'")
+conn.commit()
+conn.close()
+
+# ------------------------------------- security: borrow_submit validation
+# The server-side validation (w is authenticated here) + the honest
+# offline refusal in client_api._local_borrow_submit.
+w.send_message(build_stu_request(
+    "borrow_submit", {"student_id": "2023-00001", "quantity": "1"}))
+_r = w.recv_message(timeout=4)
+check("borrow: missing item_name refused",
+      _r is not None and _r.payload.get("ok") is False
+      and "Item name" in str(_r.payload.get("error", "")),
+      str(_r.payload if _r else None))
+w.send_message(build_stu_request(
+    "borrow_submit", {"student_id": "", "item_name": "Probe", "quantity": "1"}))
+_r = w.recv_message(timeout=4)
+check("borrow: empty student_id refused",
+      _r is not None and _r.payload.get("ok") is False
+      and "Student ID" in str(_r.payload.get("error", "")),
+      str(_r.payload if _r else None))
+w.send_message(build_stu_request(
+    "borrow_submit", {"student_id": "2023-00001", "item_name": "Probe",
+                      "quantity": "abc"}))
+_r = w.recv_message(timeout=4)
+check("borrow: non-numeric quantity refused",
+      _r is not None and _r.payload.get("ok") is False
+      and "Quantity" in str(_r.payload.get("error", "")),
+      str(_r.payload if _r else None))
+w.send_message(build_stu_request(
+    "borrow_submit", {"student_id": "2023-00001", "item_name": "Probe",
+                      "quantity": "0"}))
+_r = w.recv_message(timeout=4)
+check("borrow: quantity below 1 refused",
+      _r is not None and _r.payload.get("ok") is False
+      and "Quantity" in str(_r.payload.get("error", "")),
+      str(_r.payload if _r else None))
+w.send_message(build_stu_request(
+    "borrow_submit", {"student_id": "2023-00001", "item_name": "Gate Meter",
+                      "quantity": "2"}))
+_r = w.recv_message(timeout=4)
+time.sleep(0.2)
+_row = database.get_connection().execute(
+    "SELECT quantity, status FROM borrow_records WHERE item_name="
+    "'Gate Meter'").fetchone()
+check("borrow: valid request lands as Pending Approval",
+      _r is not None and _r.payload.get("ok") is True
+      and _row is not None and _row["status"] == "Pending Approval"
+      and str(_row["quantity"]) == "2",
+      str(dict(_row) if _row else None))
+conn = database.get_connection()
+conn.execute("DELETE FROM borrow_records WHERE item_name='Gate Meter'")
+conn.commit()
+conn.close()
+import client_api
+check("borrow offline fallback refuses honestly (no phantom rows)",
+      client_api._local_borrow_submit("", "", "x").get("ok") is False,
+      str(client_api._local_borrow_submit("", "", "x")))
+
 # ------------------------------------------------------- UDP LAN discovery
 from protocol import discovery_udp_port
 check("discovery UDP port is TCP+1 (8443 -> 8444)",
@@ -3989,12 +4139,17 @@ check("Dashboard PC grid filters instantly as you type",
       f"base={len(_cards0)} none={len(_cards_none)} "
       f"hit={len(_cards_hit)} back={len(_cards_back)}")
 
-# selecting a PC enables the controls
+# selecting a PC enables the controls (Remote is deliberately stricter -
+# single ONLINE PC, Task 5 - and has its own checks below)
 first_item = dash.client_tree.get_children()[0]
 dash.client_tree.selection_set(first_item)
 dash._on_client_select()
 check("selecting a PC enables controls",
-      all(str(b.cget("state")) == "normal" for b in dash._ctrl_btns))
+      all(str(b.cget("state")) == "normal" for b in dash._ctrl_btns
+          if b is not dash._remote_btn),
+      f"selected={dash._selected_pcs} row_vals="
+      f"{dash.client_tree.item(first_item, 'values')!r} btn_states="
+      f"{[(str(b.cget('text'))[:14], str(b.cget('state'))) for b in dash._ctrl_btns]}")
 # Task 5: [ 🖱 Remote ] lives with the other PC controls but is stricter -
 # it needs exactly one selected AND online PC.
 _rb = getattr(dash, "_remote_btn", None)

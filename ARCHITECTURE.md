@@ -80,7 +80,7 @@ decides which one it is; nothing else needs to change.
 | Student UI | `student_dashboard.py` | Announcements / messages / borrowing (:38) |
 | Data bridge | `client_api.py` | Network-first fetches for the student UI with SQLite fallback (:17) |
 | UI framework | `components.py`, `theme.py`, `utils.py`, `crud_frame.py` | Shared widgets, design tokens, styling helpers, reusable CRUD tables/pages |
-| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py`, `_full_sweep.py`, `_contrast_all.py` (all via `gate.bat`) | 588 + 290 + 50 checks, self-contained |
+| Tests | `_test_integration.py`, `_test_client_gui.py`, `_probe_layout.py`, `_full_sweep.py`, `_contrast_all.py` (all via `gate.bat`) | 606 + 290 + 50 checks, self-contained |
 | Build | `build_exe.bat`, `requirements.txt` | PyInstaller onefile builds for both apps |
 | Assets | `assets/`, `pc_icons/`, `app_icon.ico` | Logo, 8 PC status icons, window icon |
 | Design docs | `design-system/lab-management-system/MASTER.md` | Token/component spec behind `theme.py` |
@@ -213,7 +213,7 @@ audit database.
 Tooling (underscore = development only, never packaged by
 `build_exe.bat`):
 
-**`_test_integration.py`** — the 588-check end-to-end suite: boots a
+**`_test_integration.py`** — the 606-check end-to-end suite: boots a
 real `LabServer` on test port 18443 against a scripted fake TLS client,
 asserts on the real database, builds the dashboard, drives the screen
 share, and re-checks the guardrails, watchdog and uninstaller. Prints
@@ -640,7 +640,7 @@ first failing stage:
 
 | Suite | Checks | Covers |
 |---|---|---|
-| `_test_integration.py` | **588** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands + client ack detail (`force_login` / `login_allowed`), dashboard layout, role gating, Accounts bulk CSV upload, Send File desktop push, screen share (admin-gated fan-out, drop-on-slow, JPEG frames, ack-resolved START/STOP), remote input normalization + key translation (VkKeyScan Shift), guardrails, watchdog registration repair + self-heal, the guard watcher (one cycle, respawn argv, single-mutex, task/flag stand-down, `--watchdog`/`--respawn` gates), CAD policy hardening (recorded registry writes, apply/clear/sync), the standalone uninstaller (static + behavioural), Force Unlock = all PCs (offline unlock remembered), roster refresh on password/account change |
+| `_test_integration.py` | **606** | protocol framing, auth + lockout + first-login change, sessions, audit taxonomy, Website Access (push/ack/DNS repair/detection), UDP discovery, status engine, bulk commands + client ack detail (`force_login` / `login_allowed`), dashboard layout, role gating, Accounts bulk CSV upload, Send File desktop push, screen share (admin-gated fan-out, drop-on-slow, JPEG frames, ack-resolved START/STOP), remote input normalization + key translation (VkKeyScan Shift), guardrails, watchdog registration repair + self-heal, the guard watcher (one cycle, respawn argv, single-mutex, task/flag stand-down, `--watchdog`/`--respawn` gates), CAD policy hardening (recorded registry writes, apply/clear/sync), the standalone uninstaller (static + behavioural), Force Unlock = all PCs (offline unlock remembered), roster refresh on password/account change, auth gate on student requests (roster/web policy/log flush policy), account lockout (threshold + expiry + reset), borrow validation |
 | `_test_client_gui.py` | **290** | kiosk state machine, lock/pause/logout, command de-dup, offline login + local queue, web policy ack, watchdog, hotkeys, observe clamps, Send File dispatch, screen-share overlay (open/paint/drop/rejoin/stop/timeout + hotkey arming), panic stop from any state, CAD policies follow every screen (login/unlock/pause/share/panic), login accepted after a no-session unlock, `auto_start` flag vs Run entry |
 | `_probe_layout.py` | **50** | responsive layout at 1080×700 / 1280×780 / 1440×900 |
 | `_full_sweep.py` | — | every admin page at 3 sizes + hard resizes: fails on clipped captions, page overflow or children outside the window |

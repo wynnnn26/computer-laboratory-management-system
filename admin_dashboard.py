@@ -50,7 +50,8 @@ from components import CardFrame, PaddedFrame
 # ---------------------------------------------------------------------------
 AUDIT_TAXONOMY = {
     "Login / Logout": (
-        {"login_success", "login_failed", "client_login", "client_relogin",
+        {"login_success", "login_failed", "login_locked", "client_login",
+         "client_relogin",
          "client_login_failed", "client_logout", "client_admin_login",
          "client_admin_logout", "password_changed", "session_start_blocked",
          "force_logout"},
@@ -88,6 +89,7 @@ AUDIT_TAXONOMY = {
 AUDIT_LABELS = {
     "login_success": "Server Login",
     "login_failed": "Server Login Failed",
+    "login_locked": "Account Locked Out",
     "client_login": "Client Login",
     "client_relogin": "Client Re-Login",
     "client_login_failed": "Client Login Failed",
