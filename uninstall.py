@@ -7,10 +7,11 @@ Removes, in this order:
   1. both watchdog tasks        - nothing can restart the client
   2. the HKCU Run entry         - it cannot start at sign-in
   3. the HKCU CAD policies       - Ctrl+Alt+Del is fully normal again
-  4. every running client.exe   - the kiosk really stops
-  5. the local audit log        - exported to CSV first; kept, not
+  4. the QUIC firewall rule      - outbound UDP 443 (HTTP/3) flows again
+  5. every running client.exe   - the kiosk really stops
+  6. the local audit log        - exported to CSV first; kept, not
                                   deleted, when that export fails
-  6. the client files           - client.exe, lab_client.db*, lab_config.json
+  7. the client files           - client.exe, lab_client.db*, lab_config.json
 
 Every step reports its own outcome (failures start with "FAILED:", never
 a polite lie), the result is shown in a message box, and the app then
@@ -30,7 +31,7 @@ import sys
 
 from startup_ids import (WATCHDOG_TASK_LOGON, WATCHDOG_TASK_REPEAT,
                          STARTUP_KEY_PATH, STARTUP_VALUE_NAME,
-                         CAD_POLICY_VALUES)
+                         CAD_POLICY_VALUES, FIREWALL_QUIC_RULE)
 
 CLIENT_IMAGE = "client.exe"
 # the files a Client install owns in THIS folder
@@ -103,6 +104,19 @@ def remove_cad_policy():
             out.append(f"FAILED: Ctrl+Alt+Del restriction not cleared: "
                        f"{name} ({e})")
     return out
+
+
+def remove_firewall_rule():
+    """Remove the machine-wide QUIC (UDP 443) firewall rule the kiosk
+    creates (Bug 3); a missing rule counts as done (rerun-safe)."""
+    rc, text = _run(["netsh", "advfirewall", "firewall", "delete", "rule",
+                     f"name={FIREWALL_QUIC_RULE}"])
+    low = text.lower()
+    if "no rules match" in low or "not found" in low:
+        return "QUIC firewall rule already gone"
+    if rc == 0:
+        return "QUIC firewall rule removed"
+    return f"FAILED: QUIC firewall rule not removed ({text})"
 
 
 def stop_client():
@@ -202,6 +216,7 @@ def main(argv=None):
     lines += remove_tasks()
     lines.append(remove_run_entry())
     lines += remove_cad_policy()
+    lines.append(remove_firewall_rule())
     lines.append(stop_client())
     lines += export_and_remove_files()
     ok = not any(l.startswith("FAILED") for l in lines)

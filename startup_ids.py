@@ -14,6 +14,11 @@ WATCHDOG_TASK_REPEAT = "Computer Laboratory Client Watchdog"
 STARTUP_VALUE_NAME = "Computer Laboratory Client"
 STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
+# Machine-wide outbound UDP 443 (QUIC) firewall rule (Bug 3): created by
+# the kiosk on start (web_access.set_udp443_block) and removed by
+# --uninstall-startup and uninstall.exe, so the name lives here too.
+FIREWALL_QUIC_RULE = "Laboratory Kiosk - block QUIC (UDP 443)"
+
 # HKCU policy values the Client hardens while a kiosk screen is up
 # (client.cad_policy_apply) and clears again on the bare desktop
 # (client.cad_policy_clear).  uninstall.exe clears exactly these too.

@@ -321,7 +321,7 @@ class LabServer:
         # control session (audited) rather than leaving one dangling.
         for name in list(getattr(self, "remote_sessions", {}) or {}):
             try:
-                self.end_remote_control_on_drop(name)
+                self.end_remote_control_on_drop(name, "server shutting down")
             except Exception:
                 traceback.print_exc()
         # Never escalate a disconnect to a crash after shutdown (P3).
@@ -522,7 +522,8 @@ class LabServer:
                                 ev.set()
             for name in dropped:
                 try:
-                    self.end_remote_control_on_drop(name)
+                    self.end_remote_control_on_drop(name,
+                                                   "no heartbeat for 15s")
                 except Exception:
                     traceback.print_exc()
 
@@ -779,7 +780,7 @@ class LabServer:
         # active session.  The end-of-session audit row is written here
         # too - the Client is gone, so no ack can ever arrive for it.
         try:
-            self.end_remote_control_on_drop(entry.pc_name)
+            self.end_remote_control_on_drop(entry.pc_name, "connection closed")
         except Exception:
             traceback.print_exc()
         if entry.is_online:
@@ -2400,27 +2401,31 @@ class LabServer:
         return {"success": ok or not bool(sess), "command_id": cid,
                 "session_id": (sess or {}).get("session_id", "")}
 
-    def end_remote_control_on_drop(self, pc) -> bool:
+    def end_remote_control_on_drop(self, pc, reason="client disconnected") -> bool:
         """Force-end a remote session the moment its Client disappears.
 
         Called from the heartbeat sweep, the connection-closed path and
         server shutdown.  The Client can never be reconnected back INTO an
         active session: the session is gone from the table first, so a
-        re-register starts from a clean state.
+        re-register starts from a clean state.  `reason` says WHICH way it
+        died (no heartbeat vs socket closed vs shutdown) and is carried
+        into the audit row, the activity log and the console's
+        "Connection: LOST (...)" badge, so a lab retest can tell a stalled
+        Client (heartbeats stopped) from a broken link at a glance.
         """
         with self._remote_lock:
             sess = self.remote_sessions.pop(pc, None)
         if not sess:
             return False
         cid = self._audit_command(pc, "cmd_remote_stop",
-                                  {"reason": "client disconnected",
+                                  {"reason": reason,
                                    "session_id": sess.get("session_id", "")},
                                   sess.get("admin", "") or "system",
                                   status="Sent")
-        self._audit_done(cid, False, "client disconnected - session ended")
+        self._audit_done(cid, False, f"{reason} - session ended")
         self._log_activity(sess.get("admin") or "system",
                            "remote_control_stop", pc,
-                           f"result=FAILED reason=client disconnected "
+                           f"result=FAILED reason={reason} "
                            f"client_user={sess.get('client_user', '-')} "
                            f"session_id={sess.get('session_id', '')} type=LAN")
         ev = self.screen_watchers.pop(pc, None)
@@ -2430,7 +2435,7 @@ class LabServer:
         if entry:
             entry.screen_streaming = False
         self._emit("remote_stopped", {"pc_name": pc,
-                                      "reason": "client disconnected"})
+                                      "reason": reason})
         return True
 
     def forward_remote_input(self, pc, events, admin="", role="") -> bool:

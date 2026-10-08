@@ -1114,6 +1114,74 @@ _r = _d.can_close(dict(_ev, browser_pid=0))
 check("[close] condition 5: an unidentified browser_pid never closes",
       _r[0] is False and "positively identified" in _r[1], str(_r))
 
+# --- Bug 3: Brave/Opera/Vivaldi are enforceable browsers, and QUIC (HTTP/3
+# over UDP 443) is forced off machine-wide - a UDP socket has no remote
+# address, so Chrome/Brave were invisible to the scanner until now.
+check("[web] brave/opera/vivaldi count as browsers, the old three kept",
+      all(b in _wa.BROWSERS for b in (
+          "chrome.exe", "msedge.exe", "firefox.exe",
+          "brave.exe", "opera.exe", "vivaldi.exe"))
+      and not any(b in _wa.BROWSERS
+                  for b in ("notepad.exe", "iexplore.exe")),
+      str(_wa.BROWSERS))
+_r = _d.can_close(dict(_ev, browser="brave.exe"))
+check("[close] condition 4 passes for Brave like for the others",
+      _r == (True, ""), str(_r))
+
+class _FakeSub2:
+    CREATE_NO_WINDOW = 0
+    def __init__(self):
+        self.calls, self.result = [], (0, "Ok.")
+    def run(self, args, **kw):
+        self.calls.append(list(args))
+        rc, text = self.result
+        return type("R", (), {"returncode": rc,
+                              "stdout": text, "stderr": ""})()
+
+_fwsub = _FakeSub2()
+_web_sub_orig = _wa.subprocess
+try:
+    _wa.subprocess = _fwsub
+    _ok, _why = _wa.set_udp443_block(True)
+    check("[quic] enable is delete-then-add of the shared rule, out/UDP 443",
+          _ok and len(_fwsub.calls) == 2
+          and _fwsub.calls[0][:5] == ["netsh", "advfirewall", "firewall",
+                                      "delete", "rule"]
+          and _fwsub.calls[1][:5] == ["netsh", "advfirewall", "firewall",
+                                      "add", "rule"]
+          and f"name={_wa.FIREWALL_QUIC_RULE}" in _fwsub.calls[1]
+          and "dir=out" in _fwsub.calls[1]
+          and "action=block" in _fwsub.calls[1]
+          and "protocol=UDP" in _fwsub.calls[1]
+          and "remoteport=443" in _fwsub.calls[1],
+          str(_fwsub.calls))
+    _fwsub.calls.clear()
+    _fwsub.result = (1, "The requested operation requires elevation "
+                        "(Run as administrator).")
+    _ok, _why = _wa.set_udp443_block(True)
+    check("[quic] without elevation it reports the refusal, never raises",
+          _ok is False and "Administrator" in _why
+          and len(_fwsub.calls) == 2, f"ok={_ok} why={_why}")
+    _fwsub.calls.clear()
+    _fwsub.result = (1, "No rules match the specified criteria.")
+    _ok, _why = _wa.set_udp443_block(False)
+    check("[quic] disable removes the rule; a missing rule counts as done",
+          _ok is True and len(_fwsub.calls) == 1
+          and _fwsub.calls[0][:5] == ["netsh", "advfirewall", "firewall",
+                                      "delete", "rule"]
+          and f"name={_wa.FIREWALL_QUIC_RULE}" in _fwsub.calls[0],
+          str(_fwsub.calls))
+    class _BoomSub:
+        CREATE_NO_WINDOW = 0
+        def run(self, args, **kw):
+            raise OSError("netsh exploded")
+    _wa.subprocess = _BoomSub()
+    _ok, _why = _wa.set_udp443_block(True)
+    check("[quic] a crashing netsh is reported, never raised",
+          _ok is False and "netsh exploded" in _why, str((_ok, _why)))
+finally:
+    _wa.subprocess = _web_sub_orig
+
 _r = _d.close_browser(_ev)
 check("[close] one validated PID is terminated exactly once",
       _r[0] is True and _proc.terminated is True
@@ -2093,6 +2161,33 @@ check("input can never be forwarded into an ended session",
       srv.forward_remote_input("TEST-PC", [
           {"kind": "mouse", "action": "move", "x": 0.5, "y": 0.5}],
           role="admin") is False)
+# Bug 1 (lab retest): the drop reason tells a stalled Client (heartbeats
+# stopped) from a broken link (socket closed) - it must reach both the
+# audit row and the activity log the console renders.
+_r4 = srv.start_remote_control("TEST-PC", "tester", role="admin")
+check("remote restart for the drop-reason audit works",
+      _r4.get("success") is True)
+check("force-end carries the caller's drop reason",
+      srv.end_remote_control_on_drop(
+          "TEST-PC", "no heartbeat for 15s") is True
+      and "TEST-PC" not in srv.remote_sessions)
+time.sleep(0.3)
+conn = database.get_connection()
+_rreason = conn.execute(
+    "SELECT params FROM client_commands "
+    "WHERE command_type='cmd_remote_stop' AND target_pc='TEST-PC' "
+    "ORDER BY id DESC LIMIT 1").fetchone()
+_areason = conn.execute(
+    "SELECT details FROM admin_activity_log "
+    "WHERE action='remote_control_stop' ORDER BY id DESC LIMIT 1"
+).fetchone()
+conn.close()
+check("the drop reason lands in the audit row and the activity log",
+      "no heartbeat for 15s" in str(_rreason["params"] if _rreason else "")
+      and "reason=no heartbeat for 15s" in str(_areason["details"]
+                                               if _areason else ""),
+      f"{dict(_rreason) if _rreason else None} "
+      f"{dict(_areason) if _areason else None}")
 srv.stop_screen_observe("TEST-PC", "tester")
 import admin_dashboard as _adm
 check("remote audit rows have a human-readable Action label",
@@ -4420,18 +4515,32 @@ _GFILES = ["client.py", "server.py", "web_access.py", "dns_filter.py",
            "admin_dashboard.py"]
 _gsrc = {f: _gio.open(os.path.join(_GROOT, f), encoding="utf-8",
                       errors="replace").read() for f in _GFILES}
-_gall = "\n".join(_gsrc.values()).lower()
 _gc = _gsrc["client.py"]
 _gdn = _gsrc["dns_filter.py"]
 
-# G1 - no hardware / boot / driver / service surgery anywhere in the code
+# G1 - no hardware / boot / driver / service surgery anywhere in the code.
+# ONE sanctioned exception (Bug 3, operator decision): web_access's
+# set_udp443_block runs the narrowly scoped outbound UDP 443 (QUIC) rule -
+# idempotent, elevation-checked, removed by uninstall.  "netsh" outside
+# that single function, or in any other file, still fails G1 - and if the
+# function ever disappears the exception closes with it.
+_gwa_full = _gsrc["web_access.py"]
+_fw_at = _gwa_full.find("def set_udp443_block")
+_fw_end = _gwa_full.find("\ndef ", _fw_at + 5) if _fw_at >= 0 else -1
+_fw_ok = _fw_at > 0
+_gwa_rest = ((_gwa_full[:_fw_at]
+              + (_gwa_full[_fw_end:] if _fw_end != -1 else ""))
+             if _fw_ok else _gwa_full)
+_gall = "\n".join([_gsrc[f] if f != "web_access.py" else _gwa_rest
+                   for f in _GFILES]).lower()
 _GFORBID = ["bcdedit", "set-service", "sc.exe", "pnputil", "driverquery",
             "get-pnpdevice", "disable-netadapter", "reg add", "reg.exe",
             "os.system(", "wmic", "powercfg", "win32serviceutil", "netsh",
             "taskkill", "pkill", "killall", "startupapproved"]
 _gbad = [b for b in _GFORBID if b in _gall]
 check("guardrail G1: no hardware/boot/driver/service surgery in the code",
-      _gbad == [], str(_gbad))
+      _fw_ok and _gbad == [],
+      str(_gbad) if _fw_ok else "set_udp443_block not found in web_access.py")
 
 # G2 - the hosts file is edited only between OUR markers, and a line the
 #      administrator wrote by hand stays byte-for-byte intact
@@ -4564,11 +4673,36 @@ check("[uninstall] covers every artifact a Client install owns",
       _un.CLIENT_IMAGE == "client.exe"
       and "client.exe" in _un.CLIENT_FILE_PATTERNS
       and "lab_client.db*" in _un.CLIENT_FILE_PATTERNS
-      and "lab_config.json" in _un.CLIENT_FILE_PATTERNS,
+      and "lab_config.json" in _un.CLIENT_FILE_PATTERNS
+      and _un.FIREWALL_QUIC_RULE == _sids.FIREWALL_QUIC_RULE
+      == _wa.FIREWALL_QUIC_RULE,
       str(_un.CLIENT_FILE_PATTERNS))
 check("[uninstall] imports without side effects (all work lives in main)",
       callable(_un.main) and callable(_un.stop_client)
-      and callable(_un.export_and_remove_files), "import-only")
+      and callable(_un.export_and_remove_files)
+      and callable(_un.remove_firewall_rule), "import-only")
+
+# --- Bug 3: --uninstall-startup releases the QUIC firewall rule too --------
+# (client.uninstall_startup_work is the path shared by client.py and
+# main.py; everything it touches is recorded, nothing real runs.)
+_uw_log = []
+_uw_orig = (client_mod.set_auto_start, client_mod.remove_startup_registration,
+            client_mod.remove_watchdog, client_mod.cad_policy_clear,
+            client_mod.web_access.set_udp443_block)
+try:
+    client_mod.set_auto_start = lambda on: None
+    client_mod.remove_startup_registration = lambda: True
+    client_mod.remove_watchdog = lambda: True
+    client_mod.cad_policy_clear = lambda: None
+    client_mod.web_access.set_udp443_block = \
+        lambda en: (_uw_log.append(en), (True, ""))[1]
+    _uw = client_mod.uninstall_startup_work()
+    check("[uninstall] --uninstall-startup releases the QUIC firewall rule",
+          _uw == (True, True) and _uw_log == [False], str((_uw, _uw_log)))
+finally:
+    (client_mod.set_auto_start, client_mod.remove_startup_registration,
+     client_mod.remove_watchdog, client_mod.cad_policy_clear,
+     client_mod.web_access.set_udp443_block) = _uw_orig
 
 # ---- CAD policy hardening (Bug 2): registry writes are RECORDED, never ---
 # real: _reg_write/_reg_delete are the choke points both suites swap, so a
@@ -4812,6 +4946,9 @@ try:
               bool(_popen_rec)
               and _popen_rec[0][:-1] == client_mod._startup_argv()
               and _popen_rec[0][-1] == "--respawn", str(_popen_rec))
+        check("[guard] the respawn is recorded as durable evidence",
+              any(s == "INFO" and "relaunched" in m.lower()
+                  for s, m in _wd_ev), str(_wd_ev[-3:]))
     finally:
         client_mod.subprocess = _sub_orig
     # run_guard itself: its own mutex keeps it single (a second guard
@@ -4838,6 +4975,110 @@ try:
     finally:
         client_mod._guard_tick = _gt_orig
         client_mod.acquire_guard_instance = _agi_orig
+    # --- Bug 2: ensure_guard re-asserts a dead guard -----------------------
+    # A guard that died (or a start that never spawned one) used to be
+    # replaced by NOTHING: End Task then fell back to the 60 s Task
+    # Scheduler backstop.  Every quiet tick / heal cycle now probes the
+    # guard mutex and replaces a missing guard - without re-booting a
+    # healthy one every minute.
+    _sp2_orig = client_mod._spawn_guard
+    _agi2_orig = client_mod.acquire_guard_instance
+    _rgi2_orig = client_mod.release_guard_instance
+    _eg_spawn = []
+    try:
+        client_mod._spawn_guard = lambda: _eg_spawn.append("spawn")
+        client_mod.acquire_guard_instance = lambda: False     # guard alive
+        client_mod.release_guard_instance = lambda: _eg_spawn.append("rel")
+        client_mod.ensure_guard()
+        check("[guard] ensure_guard leaves a live guard alone",
+              _eg_spawn == [], str(_eg_spawn))
+        client_mod.acquire_guard_instance = lambda: True      # guard dead
+        client_mod.ensure_guard()
+        check("[guard] ensure_guard probes, releases and replaces a dead guard",
+              _eg_spawn == ["rel", "spawn"], str(_eg_spawn))
+        def _probe_boom():
+            raise RuntimeError("probe boom")
+        client_mod.acquire_guard_instance = _probe_boom
+        _eg_err = ""
+        try:
+            client_mod.ensure_guard()
+        except Exception as _e:
+            _eg_err = str(_e)
+        check("[guard] ensure_guard never raises", _eg_err == "", _eg_err)
+    finally:
+        (client_mod._spawn_guard, client_mod.acquire_guard_instance,
+         client_mod.release_guard_instance) = (_sp2_orig, _agi2_orig,
+                                               _rgi2_orig)
+    # guard start evidence: the lab test reads this row next to the
+    # respawn row to see WHEN a guard (re)appeared
+    _sg_proc = client_mod._GUARD_PROC
+    _sub2_orig = client_mod.subprocess
+    client_mod._GUARD_PROC = None
+    client_mod.subprocess = _FakeSub
+    try:
+        client_mod._spawn_guard()
+        check("[guard] guard start is recorded as durable evidence",
+              any(s == "INFO" and m == "Relaunch guard started"
+                  for s, m in _wd_ev), str(_wd_ev[-3:]))
+    finally:
+        client_mod.subprocess = _sub2_orig
+        client_mod._GUARD_PROC = _sg_proc
+    # --- Bug 2: run_client's early exits re-assert the guard ----------------
+    # quiet = a scheduled tick found the kiosk alive; conflict = a human's
+    # second copy.  Both must leave a guard behind - but ONLY while the
+    # watchdog task still exists: panic/uninstall delete that task
+    # precisely so nothing relaunches, and their quiet exit must never
+    # resurrect the kiosk they killed.
+    _rc_orig = (client_mod._watchdog_conflict, client_mod.ensure_guard,
+                client_mod.auto_start_enabled,
+                client_mod._notify_already_running, client_mod.ClientApp,
+                client_mod._task_exists, sys.argv)
+    _rc_log = []
+
+    def _no_app():
+        raise AssertionError("an early exit continued into the kiosk")
+
+    def _run_rc():
+        try:
+            client_mod.run_client()
+            return ""
+        except Exception as _e:
+            return repr(_e)
+
+    try:
+        client_mod.ensure_guard = lambda: _rc_log.append("ensure")
+        client_mod.auto_start_enabled = lambda: True
+        client_mod.ClientApp = _no_app
+        client_mod._notify_already_running = lambda: _rc_log.append("notify")
+        sys.argv = ["client.py", "--watchdog"]
+        client_mod._watchdog_conflict = lambda: "quiet"
+        client_mod._task_exists = lambda n: True
+        _e1 = _run_rc()
+        check("[guard] a quiet tick re-asserts the guard",
+              _rc_log == ["ensure"] and _e1 == "", f"{_rc_log} {_e1}")
+        _rc_log.clear()
+        client_mod._task_exists = lambda n: False       # panic deleted it
+        _e2 = _run_rc()
+        check("[guard] a quiet tick after the task is gone resurrects nothing",
+              _rc_log == [] and _e2 == "", f"{_rc_log} {_e2}")
+        _rc_log.clear()
+        client_mod._watchdog_conflict = lambda: "conflict"
+        client_mod._task_exists = lambda n: True
+        _e3 = _run_rc()
+        check("[guard] a human's second copy re-asserts the guard too",
+              _rc_log == ["ensure", "notify"] and _e3 == "",
+              f"{_rc_log} {_e3}")
+        check("[guard] the start-origin evidence names every starter",
+              client_mod._start_origin(True) == "hand start"
+              and client_mod._start_origin(
+                  False, ["client.py", "--respawn"]) == "guard respawn"
+              and client_mod._start_origin(
+                  False, ["client.py", "--watchdog"]) == "watchdog task")
+    finally:
+        (client_mod._watchdog_conflict, client_mod.ensure_guard,
+         client_mod.auto_start_enabled, client_mod._notify_already_running,
+         client_mod.ClientApp, client_mod._task_exists) = _rc_orig[:6]
+        sys.argv = _rc_orig[6]
 finally:
     client_mod._schtasks = _wd_sch_orig
     client_mod._watchdog_evidence = _wd_ev_orig
@@ -4862,8 +5103,9 @@ check("[watchdog] WARN evidence is throttled to one per hour",
 import shutil as _shutil
 _un_run_orig = _un._run
 _un_saved = {n: getattr(_un, n) for n in (
-    "remove_tasks", "remove_run_entry", "stop_client",
-    "export_and_remove_files", "_report", "_self_delete", "_base_dir")}
+    "remove_tasks", "remove_run_entry", "remove_firewall_rule",
+    "stop_client", "export_and_remove_files", "_report", "_self_delete",
+    "_base_dir")}
 try:
     # remove_tasks issues real deletion commands for BOTH exact names
     _calls = []
@@ -4902,6 +5144,8 @@ try:
                                 ["Task removed: x"])[1]
     _un.remove_run_entry = lambda: (_seq.append("run"),
                                     "Startup entry removed: x")[1]
+    _un.remove_firewall_rule = lambda: (_seq.append("firewall"),
+                                        "QUIC firewall rule removed")[1]
     _un.stop_client = lambda: (_seq.append("stop"),
                                "Client stopped (client.exe is not running)")[1]
     _un.export_and_remove_files = lambda: (_seq.append("files"),
@@ -4911,7 +5155,7 @@ try:
     _rc = _un.main(["--quiet"])
     check("[uninstall] happy path: ordered steps, exit 0, self-delete last",
           _rc == 0
-          and _seq == ["tasks", "run", "stop", "files",
+          and _seq == ["tasks", "run", "firewall", "stop", "files",
                        ("report", True, True), "selfdelete"],
           str(_seq))
     # a FAILED anywhere -> exit 1, no self-delete, operator told to rerun

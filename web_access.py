@@ -38,18 +38,23 @@ unambiguous domain (P1.2).
 import os
 import socket
 import struct
+import subprocess
 import threading
 import time
 
 import psutil
 
 from dns_filter import normalize, decide
+from startup_ids import FIREWALL_QUIC_RULE
 
 MODES = ("allow_all", "block_list", "allow_only")
 
-# the browsers we are allowed to consider responsible (spec: Chrome, Edge
-# and Firefox where possible - anything else is UNRESOLVED, never killed)
-BROWSERS = ("chrome.exe", "msedge.exe", "firefox.exe")
+# the browsers we are allowed to consider responsible.  Originally
+# chrome/edge/firefox only (Bug 3); Brave, Opera and Vivaldi are Chrome
+# builds that run the same enforcement, and a lab that blocks on them
+# must not fall through to UNRESOLVED (never closed).
+BROWSERS = ("chrome.exe", "msedge.exe", "firefox.exe",
+            "brave.exe", "opera.exe", "vivaldi.exe")
 
 # connection states that count as evidence of an attempt or a visit
 # (TIME_WAIT/FIN_* catch a page that opened and closed between polls)
@@ -68,6 +73,56 @@ REFRESH_INTERVAL = 300.0
 # one violation closes the browser, hammering re-opens it, and we must
 # not turn that into a kill loop
 KILL_COOLDOWN = 60.0
+
+
+def set_udp443_block(enabled):
+    """Create/remove the machine-wide outbound UDP 443 (QUIC) rule (Bug 3).
+
+    Chrome/Brave/Edge and friends prefer HTTP/3 over UDP 443, and a UDP
+    socket on Windows has no remote address - the scanner in
+    _connections() can neither see it nor attribute it to a domain, so a
+    blocked site in Chrome/Brave never triggered.  Forcing QUIC off
+    machine-wide makes every browser fall back to TLS on TCP 443, where
+    the scanner already sees Edge today.
+
+    Idempotent (enable deletes before adding - netsh allows duplicate
+    names, and every kiosk start must not stack them), never raises, and
+    never blocks a start: without elevation netsh refuses and the caller
+    logs the refusal and continues.  Returns (ok, detail)."""
+    if os.name != "nt":
+        return False, "not Windows - no firewall rule"
+
+    def _netsh(args):
+        try:
+            p = subprocess.run(
+                list(args), capture_output=True, text=True, timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            text = " ".join(x for x in ((p.stdout or "").strip(),
+                                        (p.stderr or "").strip()) if x)
+            return int(p.returncode), text
+        except Exception as e:
+            return 1, str(e)
+
+    if not enabled:
+        rc, text = _netsh(["netsh", "advfirewall", "firewall", "delete",
+                           "rule", f"name={FIREWALL_QUIC_RULE}"])
+        low = text.lower()
+        if "no rules match" in low or "not found" in low:
+            return True, ""              # already gone - rerun-safe
+        return (True, "") if rc == 0 else (False, text or "netsh refused")
+    # delete first: a restart must never stack a second copy of the rule
+    _netsh(["netsh", "advfirewall", "firewall", "delete",
+            "rule", f"name={FIREWALL_QUIC_RULE}"])
+    rc, text = _netsh(["netsh", "advfirewall", "firewall", "add", "rule",
+                       f"name={FIREWALL_QUIC_RULE}", "dir=out",
+                       "action=block", "protocol=UDP", "remoteport=443"])
+    if rc == 0:
+        return True, ""
+    low = text.lower()
+    if "elevation" in low or "administrator" in low:
+        return False, ("not applied - run the Client as Administrator "
+                       f"(netsh: {text})")
+    return False, text or "netsh refused the rule"
 
 def _clean_ip(raw):
     """Normalize a peer address: drop an IPv6 zone id and brackets."""
@@ -270,9 +325,10 @@ def _create_time(pid):
 
 
 def browser_root(pid):
-    """The top-most chrome/msedge/firefox process for a connection owner.
+    """The top-most browser process (see BROWSERS) for a connection
+    owner.
 
-    Chrome/Edge are multi-process: the socket usually belongs to a
+    Chrome/Edge/Brave are multi-process: the socket usually belongs to a
     network-service child, and killing that child leaves the browser
     running.  Returns (root_pid, image_name) or (0, "") when the chain
     does not end in a browser we are allowed to touch."""
@@ -703,7 +759,8 @@ class WebAccessDetector:
           1. the mode is actually enforcing (ALLOW ALL closes nothing)
           2. the event is DETECTED - UNRESOLVED is never acted on
           3. a domain is attributed AND unambiguous
-          4. the responsible process was identified as chrome/edge/firefox
+          4. the responsible process is a supported browser
+             (chrome/edge/firefox/brave/opera/vivaldi)
           5. its PID was positively identified and is not cooling down
 
         Nothing is terminated here: this is the gate the caller reports
@@ -722,7 +779,7 @@ class WebAccessDetector:
         if browser not in BROWSERS:
             return False, (f"responsible process "
                            f"({ev.get('process') or 'unknown'}) is not "
-                           f"chrome/edge/firefox")
+                           f"chrome/edge/firefox/brave/opera/vivaldi")
         if int(ev.get("browser_pid") or 0) <= 0:
             return False, "no positively identified browser process"
         key = (ev.get("domain"), browser)

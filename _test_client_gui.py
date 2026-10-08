@@ -32,6 +32,14 @@ client._reg_write = lambda path, name, value: _cad_reg.append(
     ("set", path, name, value))
 client._reg_delete = lambda path, name: _cad_reg.append(("del", path, name))
 
+# --- Bug 3: the kiosk's machine-wide QUIC firewall rule is RECORDED, never
+# run for real here - a crashed run must never leave firewall rules behind
+# on this PC (same contract as the CAD registry choke points above).
+import web_access as _web
+_fw_calls = []
+_web.set_udp443_block = lambda enabled: (_fw_calls.append(bool(enabled)),
+                                          (True, ""))[1]
+
 FAIL = []
 def check(name, cond, extra=""):
     print(("PASS  " if cond else "FAIL  ") + name + (f"  {extra}" if extra else ""), flush=True)
@@ -53,6 +61,15 @@ app.update()
 check("[config] kiosk visible at start", app.winfo_viewable())
 check("[config] login state", app.state == "login")
 check("[config] session bar hidden", not app.bar.winfo_viewable())
+# Bug 3: the init thread applies the QUIC (UDP 443) firewall block before
+# anything else in _startup_web_policy - poll briefly, it runs off-path.
+import time as _fwt
+_fw_end = _fwt.time() + 5.0
+while _fwt.time() < _fw_end and not _fw_calls:
+    app.update()
+    _fwt.sleep(0.02)
+check("[web] kiosk start applies the QUIC (UDP 443) firewall block",
+      _fw_calls == [True], str(_fw_calls))
 
 # --- login card (spec): password toggle, server line, PC footer -----------
 check("[login] password show/hide widgets present",
@@ -1256,6 +1273,80 @@ tray_dash.deiconify(); tray_dash.lift(); app2.update()
 check("[p0-1] restore brings the Dashboard back",
       tray_dash.state() == "normal" and tray_dash.winfo_viewable(),
       f"state={tray_dash.state()} viewable={tray_dash.winfo_viewable()}")
+
+# --- Bug 1 (lab retest): a minimize must never stall or kill the pump -----
+# Field report: while a remote session was live, minimizing a client
+# window killed control and then dropped the link.  Drive the real
+# minimize paths repeatedly, then prove the pump still drains, both
+# timer chains re-arm and an armed session is untouched.
+app2._remote_active = True
+app2._remote_session = "gate-min"
+for _i in range(3):
+    tray_dash.iconify(); app2.update()
+    app2.bar.iconify(); app2.update()
+    tray_dash.deiconify(); app2.update()
+    app2.bar.deiconify(); app2.update()
+check("[pump] minimize battery leaves both timer chains alive",
+      app2._after_pump is not None and app2._after_tick is not None,
+      str((app2._after_pump, app2._after_tick)))
+check("[pump] an armed remote session survives the minimize battery",
+      app2._remote_active is True and app2._remote_session == "gate-min",
+      str((app2._remote_active, app2._remote_session)))
+app2._remote_active = False
+app2._remote_session = None
+_pump_probe = []
+app2.events.put({"kind": "ui_call", "fn": lambda: _pump_probe.append(1)})
+_deadline = _time.time() + 2.0
+while _time.time() < _deadline and not _pump_probe:
+    app2.update()
+    _time.sleep(0.01)
+check("[pump] the event pump still drains after the minimize battery",
+      bool(_pump_probe))
+app2.bar.withdraw()                       # back to the login-state layout
+
+# --- Bug 1 (lab retest): one poisoned event must never stop ALL handling ---
+# net_status's tail is unguarded; before the fix an exception there left
+# _after_pump unset forever - every later event (remote input included)
+# queued with nothing draining it, while _tick kept the link looking
+# healthy.  The label is cleared first because the "not configured"
+# first-run hint short-circuits the branch before the poisoned call.
+def _boom(_t=""):
+    _boom_ran.append(1)
+    raise RuntimeError("poisoned status hint (pump regression probe)")
+_boom_ran = []
+_orig_hint = app2._set_status_hint
+app2._set_status_hint = _boom
+try:
+    _slbl = getattr(app2, "status_lbl", None)
+    if _slbl is not None and _slbl.winfo_exists():
+        _slbl.configure(text="")
+except Exception:
+    pass
+app2.events.put({"kind": "net_status", "text": "poison-probe"})
+_pump_probe2 = []
+app2.events.put({"kind": "ui_call", "fn": lambda: _pump_probe2.append(1)})
+_deadline = _time.time() + 2.0
+while _time.time() < _deadline and not _pump_probe2:
+    app2.update()
+    _time.sleep(0.01)
+app2._set_status_hint = _orig_hint
+check("[pump] a poisoned event never kills the event pump",
+      bool(_pump_probe2) and app2._after_pump is not None,
+      f"probe={_pump_probe2} after_pump={app2._after_pump}")
+# direct query: pending_logs() is oldest-first and windowed, and this
+# suite has long since filled its 500-row window by this point.
+with _ls._lock:
+    _c_err = _ls.get_local_connection()
+    try:
+        _n_err = _c_err.execute(
+            "SELECT COUNT(*) FROM local_logs WHERE category='event'"
+            " AND message LIKE 'Event handler failed%'").fetchone()[0]
+    finally:
+        _c_err.close()
+check("[pump] the poisoned event is logged as an ERROR row",
+      _n_err >= 1 and _boom_ran,
+      f"rows={_n_err} boom_ran={_boom_ran}")
+
 tray_dash.destroy()
 app2.update()
 check("[p0-1] closing the Dashboard is still not a logout",

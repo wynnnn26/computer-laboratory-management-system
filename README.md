@@ -608,7 +608,7 @@ and the eight `pc_icons/*.png` status icons.
 ## Tests
 
 ```
-python _test_integration.py   # 606 checks: TLS framing, auth & role claim,
+python _test_integration.py   # 625 checks: TLS framing, auth & role claim,
                               # first-login password change (flagged
                               # accounts, sessions blocked until changed,
                               # hashed storage, audit rows),
@@ -729,7 +729,7 @@ python _test_integration.py   # 606 checks: TLS framing, auth & role claim,
                                 # (server pushes fire-and-forget, the
                                 # client syncs in the background, a
                                 # 6-hour periodic push as backstop)
-python _test_client_gui.py    # 290 checks: kiosk state machine, admin lock,
+python _test_client_gui.py    # 296 checks: kiosk state machine, admin lock,
                               # force login, pause, logout, command
                               # de-duplication, login card (password
                               # toggle, server line, PC footer),
@@ -905,9 +905,9 @@ lab_system/
 │                         pc_icons/ status icons, --collect-all
 │                         customtkinter for the dark UI; client.exe also
 │                         pulls in the pystray Windows backend)
-├── _test_integration.py  606-check end-to-end suite (server + protocol +
+├── _test_integration.py  625-check end-to-end suite (server + protocol +
 │                         admin dashboard)
-├── _test_client_gui.py   290-check kiosk state-machine suite
+├── _test_client_gui.py   296-check kiosk state-machine suite
 ├── _probe_layout.py      Responsive layout probe (no clipped rows or
 │                         panel overruns at min/default/large sizes)
 ├── gate.bat              Regression gate: both suites (fresh DBs) +

@@ -963,7 +963,7 @@ def apply_web_policy(policy, hosts_path=None, manage_dns=True):
 
 
 def _startup_web_policy(saved_policy=None):
-    """Startup order for Website Access: REPAIR first, then re-apply.
+    """Startup order for Website Access: QUIC off, REPAIR, then re-apply.
 
     A run killed by the watchdog, a crash or a power cut never executes
     its restore, so the adapter is left pointed at a resolver that no
@@ -971,6 +971,21 @@ def _startup_web_policy(saved_policy=None):
     the adapter again before that is repaired would record 127.0.0.1 as
     the "previous" value all over again.  Never raises: this runs on the
     kiosk's init path."""
+    # Bug 3: QUIC (HTTP/3 over UDP 443) sockets have no remote address,
+    # so Chrome/Brave could not be detected or blocked at all.  The
+    # machine-wide outbound UDP 443 rule forces TLS over TCP, where the
+    # scanner works (Edge always used it).  Without elevation Windows
+    # refuses the rule - log it and keep going, the kiosk must start
+    # either way.
+    if web_access is not None:
+        try:
+            _fw_ok, _fw_why = web_access.set_udp443_block(True)
+            if not _fw_ok:
+                local_store.log_event("WARN", "web",
+                                      "QUIC firewall rule not applied",
+                                      _fw_why)
+        except Exception:
+            pass
     try:
         repair_local_dns()
     except Exception:
@@ -3445,7 +3460,20 @@ class ClientApp(ctk.CTk):
         try:
             while True:
                 ev = self.events.get_nowait()
-                self._handle_event(ev)
+                # ONE poisoned event must never stop ALL event handling:
+                # net_disconnected / net_connected / net_status have
+                # unguarded tails, and an escaping exception used to kill
+                # this loop permanently - input, screenshots and commands
+                # would then queue forever with nothing draining them
+                # (remote control goes dead while heartbeats, on their own
+                # timer, keep the link looking healthy).
+                try:
+                    self._handle_event(ev)
+                except Exception:
+                    local_store.log_event(
+                        "ERROR", "event",
+                        f"Event handler failed ({ev.get('kind')})",
+                        traceback.format_exc(limit=3))
         except queue.Empty:
             pass
         try:
@@ -4174,6 +4202,9 @@ def _watchdog_heal_loop():
         time.sleep(_WATCHDOG_HEAL_SECONDS)
         try:
             register_watchdog()
+            ensure_guard()   # Bug 2: heals a dead guard even when the
+            # watchdog task itself was deleted (no ticks = no quiet
+            # path to re-assert it from).
         except Exception as e:
             print(f"[CLIENT] Watchdog self-heal skipped: {e}")
 
@@ -4257,6 +4288,10 @@ def _respawn_kiosk():
     try:
         subprocess.Popen(_startup_argv() + ["--respawn"], close_fds=True,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # Durable evidence (paired with run_client's "Kiosk started via
+        # guard respawn" row): the lab test reads both rows to measure
+        # the End Task -> relaunch latency, including the onefile boot.
+        _watchdog_evidence("INFO", "Guard relaunched the kiosk")
     except Exception as e:
         print(f"[CLIENT] Guard could not relaunch the kiosk: {e}")
 
@@ -4312,6 +4347,7 @@ def _spawn_guard():
         _GUARD_PROC = subprocess.Popen(
             _startup_argv() + ["--guard"], close_fds=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        _watchdog_evidence("INFO", "Relaunch guard started")
     except Exception as e:
         _GUARD_PROC = None
         print(f"[CLIENT] Guard not started: {e}")
@@ -4328,6 +4364,28 @@ def _stop_guard():
     try:
         if proc.poll() is None:
             proc.terminate()
+    except Exception:
+        pass
+
+
+def ensure_guard():
+    """Make sure a relaunch guard process exists next to a running kiosk.
+
+    Probes the guard mutex FIRST, so the every-minute watchdog tick and
+    the 15-minute heal loop do not re-boot a healthy guard each time: a
+    live guard answers the probe and this is a no-op; a dead (or never
+    started) guard is replaced at once.  Two racers can both pass the
+    probe - the loser exits inside run_guard() on the same mutex, so at
+    most one survives.  This is what keeps End Task on the kiosk to
+    ~GUARD_POLL_SECONDS instead of the 60 s Task Scheduler backstop:
+    before, a quiet tick left without ever re-creating a dead guard.
+    Never raises (fail-open: a broken mutex probes as "free", matching
+    acquire_guard_instance's documented contract)."""
+    try:
+        if not acquire_guard_instance():
+            return                      # a guard is already running
+        release_guard_instance()
+        _spawn_guard()
     except Exception:
         pass
 
@@ -4393,17 +4451,38 @@ def _notify_already_running():
 def uninstall_startup_work():
     """`--uninstall-startup` core, shared by client.py AND main.py: drop
     the Run entry and both watchdog tasks, switch auto-start off (so a
-    kiosk that is still running cannot heal them back) and clear the CAD
-    policies.  Returns (run_entry_ok, tasks_ok); never raises, no UI."""
+    kiosk that is still running cannot heal them back), clear the CAD
+    policies and release the machine-wide QUIC firewall rule.  Returns
+    (run_entry_ok, tasks_ok); never raises, no UI."""
     set_auto_start(False)
     ok = remove_startup_registration()
     wok = remove_watchdog()
     cad_policy_clear()
+    if web_access is not None:
+        try:
+            fwok, fw_detail = web_access.set_udp443_block(False)
+            print("[CLIENT] QUIC firewall rule removed" if fwok else
+                  f"[CLIENT] FAILED: QUIC firewall rule not removed "
+                  f"({fw_detail})")
+        except Exception as e:
+            print(f"[CLIENT] FAILED: QUIC firewall rule not removed ({e})")
     print("[CLIENT] Windows startup entry removed" if ok
           else "[CLIENT] Windows startup entry could not be removed")
     print("[CLIENT] Watchdog tasks removed" if wok
           else "[CLIENT] No watchdog tasks to remove")
     return ok, wok
+
+
+def _start_origin(hand_start=True, argv=None):
+    """Evidence label for who asked for this start (Bug 2: the relaunch
+    latency lab test reads it from the local log).  `argv` is only passed
+    by tests."""
+    if hand_start:
+        return "hand start"
+    argv = sys.argv if argv is None else argv
+    if any(str(a).lower() == "--respawn" for a in argv[1:]):
+        return "guard respawn"
+    return "watchdog task"
 
 
 def run_client():
@@ -4429,15 +4508,28 @@ def run_client():
     # health check, not an error); a human launching a second copy is
     # told why nothing opened.  Neither ever stacks a second lock screen.
     outcome = _watchdog_conflict()
-    if outcome == "quiet":
-        return
-    if outcome == "conflict":
+    if outcome in ("quiet", "conflict"):
+        # Bug 2: a live kiosk must always have a relaunch guard - before,
+        # a quiet tick left without re-creating a dead one, so End Task
+        # fell back to the 60 s Task Scheduler backstop.  The watchdog
+        # task's presence is the "relaunch still wanted" signal: panic
+        # and uninstall delete it precisely so nothing comes back, so
+        # when it is gone no guard is (re-)started here either.
+        if _task_exists(WATCHDOG_TASK_REPEAT):
+            ensure_guard()
+        if outcome == "quiet":
+            return
         _notify_already_running()
         return
     try:
         if hand_start:
             set_auto_start(True)    # a hand start re-enables auto-start
         register_startup()      # idempotent - runs on every client start
+        # Evidence: WHO started this kiosk (the log row carries the
+        # timestamp).  Paired with the guard's "Guard relaunched the
+        # kiosk" row it yields the End Task -> relaunch latency and shows
+        # whether the onefile boot or a missing guard dominated it.
+        _watchdog_evidence("INFO", f"Kiosk started via {_start_origin(hand_start)}")
         app = ClientApp()
         # Bug 4: seconds-level relaunch watcher (the minute task stays as
         # the backstop).  Started only now: the kiosk exists and already
